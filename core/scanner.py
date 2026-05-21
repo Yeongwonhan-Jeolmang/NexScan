@@ -238,7 +238,7 @@ class PortScanner:
 
     def scan_port_tcp(self, host: str, port: int) -> PortResult:
         """TCP connect scan."""
-        result = PortResult(port=port, protocol="tcp")
+        result = PortResult(port=port, state=PortState.FILTERED, protocol="tcp")
         start = time.perf_counter()
 
         try:
@@ -281,7 +281,7 @@ class PortScanner:
 
     def scan_port_udp(self, host: str, port: int) -> PortResult:
         """UDP scan with service-specific probes."""
-        result = PortResult(port=port, protocol="udp")
+        result = PortResult(port=port, state=PortState.OPEN_FILTERED, protocol="udp")
         start = time.perf_counter()
 
         probe = self._get_udp_probe(port)
