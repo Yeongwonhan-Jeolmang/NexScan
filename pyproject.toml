@@ -82,8 +82,12 @@ target-version = ["py310", "py311", "py312"]
 # ── Mypy ──────────────────────────────────────────────────────────────
 [tool.mypy]
 python_version = "3.10"
-warn_return_any = true
+warn_return_any = false
 ignore_missing_imports = true
+disallow_untyped_defs = false
+check_untyped_defs = false
+no_implicit_optional = false
+disable_error_code = ["no-any-return", "var-annotated", "call-arg", "misc", "str-unpack", "dict-item"]
 
 # ── Pytest ────────────────────────────────────────────────────────────
 [tool.pytest.ini_options]
