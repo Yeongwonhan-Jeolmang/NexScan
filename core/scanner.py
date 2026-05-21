@@ -4,18 +4,18 @@ Handles TCP connect, SYN (raw), UDP scanning with threading, banner grabbing,
 service fingerprinting, and OS detection.
 """
 
-import socket
-import threading
-import time
-import struct
-import select
-import queue
-import ipaddress
-import ssl
 import concurrent.futures
 from dataclasses import dataclass, field
-from typing import Optional, Callable
 from enum import Enum
+import ipaddress
+import queue
+import select
+import socket
+import ssl
+import struct
+import threading
+import time
+from typing import Callable, Optional
 
 from core.service_db import ServiceDatabase
 from utils.logger import get_logger
@@ -82,9 +82,9 @@ class ScanConfig:
     detect_service: bool = True
     detect_os: bool = False
     ssl_probe: bool = True
-    rate_limit: float = 0.0          # seconds between packets (0 = no limit)
+    rate_limit: float = 0.0  # seconds between packets (0 = no limit)
     retry_count: int = 1
-    jitter: float = 0.0              # random delay jitter ms
+    jitter: float = 0.0  # random delay jitter ms
     max_banner_wait: float = 2.0
     udp_payload_probes: bool = True
     follow_redirects: bool = False
@@ -148,9 +148,13 @@ class PortScanner:
         27017: b"",
     }
 
-    def __init__(self, config: ScanConfig, callback: Optional[Callable] = None,
-                 progress_callback: Optional[Callable] = None,
-                 host_callback: Optional[Callable] = None):
+    def __init__(
+        self,
+        config: ScanConfig,
+        callback: Optional[Callable] = None,
+        progress_callback: Optional[Callable] = None,
+        host_callback: Optional[Callable] = None,
+    ):
         self.config = config
         self.callback = callback
         self.progress_callback = progress_callback
@@ -312,14 +316,14 @@ class PortScanner:
     def _get_udp_probe(self, port: int) -> bytes:
         probes = {
             53: b"\x00\x00\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00"
-                b"\x07version\x04bind\x00\x00\x10\x00\x03",  # DNS version
+            b"\x07version\x04bind\x00\x00\x10\x00\x03",  # DNS version
             161: b"\x30\x26\x02\x01\x00\x04\x06public\xa0\x19\x02\x04\x00"
-                 b"\x00\x00\x00\x02\x01\x00\x02\x01\x00\x30\x0b\x30\x09"
-                 b"\x06\x05\x2b\x06\x01\x02\x01\x05\x00",   # SNMP
-            123: b"\x1b" + b"\x00" * 47,                    # NTP
+            b"\x00\x00\x00\x02\x01\x00\x02\x01\x00\x30\x0b\x30\x09"
+            b"\x06\x05\x2b\x06\x01\x02\x01\x05\x00",  # SNMP
+            123: b"\x1b" + b"\x00" * 47,  # NTP
             137: b"\x00\x01\x00\x00\x00\x01\x00\x00\x00\x00\x00\x00"
-                 b"\x20CKAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\x00\x00\x21\x00\x01",
-            500: b"\x00" * 28,                              # IKE
+            b"\x20CKAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\x00\x00\x21\x00\x01",
+            500: b"\x00" * 28,  # IKE
         }
         return probes.get(port, b"\x00\x00")
 
@@ -372,8 +376,7 @@ class PortScanner:
             ctx.check_hostname = False
             ctx.verify_mode = ssl.CERT_NONE
             conn = ctx.wrap_socket(
-                socket.create_connection((host, port), timeout=3),
-                server_hostname=host
+                socket.create_connection((host, port), timeout=3), server_hostname=host
             )
             cert = conn.getpeercert()
             cipher = conn.cipher()
@@ -388,13 +391,15 @@ class PortScanner:
             if cert:
                 subject = dict(x[0] for x in cert.get("subject", []))
                 issuer = dict(x[0] for x in cert.get("issuer", []))
-                info.update({
-                    "common_name": subject.get("commonName", ""),
-                    "issuer": issuer.get("organizationName", ""),
-                    "not_before": cert.get("notBefore", ""),
-                    "not_after": cert.get("notAfter", ""),
-                    "san": [v for _, v in cert.get("subjectAltName", [])],
-                })
+                info.update(
+                    {
+                        "common_name": subject.get("commonName", ""),
+                        "issuer": issuer.get("organizationName", ""),
+                        "not_before": cert.get("notBefore", ""),
+                        "not_after": cert.get("notAfter", ""),
+                        "san": [v for _, v in cert.get("subjectAltName", [])],
+                    }
+                )
             return info
         except Exception:
             return None
@@ -404,6 +409,7 @@ class PortScanner:
         if not banner:
             return ""
         import re
+
         patterns = [
             r"(\d+\.\d+\.\d+[-.\w]*)",
             r"v(\d+\.\d+[-.\w]*)",
@@ -455,16 +461,18 @@ class PortScanner:
 
         # Most common guess
         from collections import Counter
+
         most_common = Counter(os_hints).most_common(1)[0][0]
         return most_common, confidence
 
     def scan_target(self, target: str) -> ScanResult:
         """Full scan of a single target."""
         import datetime
+
         result = ScanResult(
             target=target,
             timestamp=datetime.datetime.now().isoformat(),
-            scan_type=self.config.scan_type.value
+            scan_type=self.config.scan_type.value,
         )
 
         # Resolve target
@@ -498,10 +506,7 @@ class PortScanner:
         done = 0
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=self.config.threads) as executor:
-            future_to_port = {
-                executor.submit(scan_fn, port): port
-                for port in self.config.ports
-            }
+            future_to_port = {executor.submit(scan_fn, port): port for port in self.config.ports}
 
             for future in concurrent.futures.as_completed(future_to_port):
                 if self._stop_event.is_set():

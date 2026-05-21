@@ -4,12 +4,13 @@ Exports scan results in multiple formats: JSON, CSV, HTML, XML, TXT.
 Credits to Florian van den Bersselaar and Anna Zieleman
 """
 
-import json
 import csv
-import io
 import datetime
+import io
+import json
 from typing import List
-from core.scanner import ScanResult, PortState
+
+from core.scanner import PortState, ScanResult
 
 VERSION = "2.0"
 APP_NAME = "NexScan"
@@ -25,7 +26,7 @@ def export_json(results: List[ScanResult], pretty: bool = True) -> str:
             "total_hosts": len(results),
             "hosts_up": sum(1 for r in results if r.host_up),
             "total_open_ports": sum(r.open_count for r in results),
-        }
+        },
     }
     return json.dumps(data, indent=2 if pretty else None)
 
@@ -33,28 +34,48 @@ def export_json(results: List[ScanResult], pretty: bool = True) -> str:
 def export_csv(results: List[ScanResult]) -> str:
     output = io.StringIO()
     writer = csv.writer(output)
-    writer.writerow([
-        "Target", "IP Address", "Hostname", "Port", "Protocol", "State",
-        "Service", "Version", "Banner", "Response Time (ms)", "SSL Version",
-        "OS Guess", "Scan Duration (s)", "Timestamp"
-    ])
+    writer.writerow(
+        [
+            "Target",
+            "IP Address",
+            "Hostname",
+            "Port",
+            "Protocol",
+            "State",
+            "Service",
+            "Version",
+            "Banner",
+            "Response Time (ms)",
+            "SSL Version",
+            "OS Guess",
+            "Scan Duration (s)",
+            "Timestamp",
+        ]
+    )
     for r in results:
         for p in r.ports:
             if p.state == PortState.OPEN:
                 ssl_ver = ""
                 if p.ssl_info:
                     ssl_ver = p.ssl_info.get("version", "")
-                writer.writerow([
-                    r.target, r.ip_address, r.hostname,
-                    p.port, p.protocol, p.state.value,
-                    p.service, p.version,
-                    p.banner.replace("\n", " ").replace("\r", "")[:100],
-                    round(p.response_time * 1000, 2),
-                    ssl_ver,
-                    r.os_guess,
-                    round(r.scan_duration, 3),
-                    r.timestamp
-                ])
+                writer.writerow(
+                    [
+                        r.target,
+                        r.ip_address,
+                        r.hostname,
+                        p.port,
+                        p.protocol,
+                        p.state.value,
+                        p.service,
+                        p.version,
+                        p.banner.replace("\n", " ").replace("\r", "")[:100],
+                        round(p.response_time * 1000, 2),
+                        ssl_ver,
+                        r.os_guess,
+                        round(r.scan_duration, 3),
+                        r.timestamp,
+                    ]
+                )
     return output.getvalue()
 
 
@@ -62,22 +83,28 @@ def export_xml(results: List[ScanResult]) -> str:
     lines = ['<?xml version="1.0" encoding="UTF-8"?>']
     lines.append(f'<nexscan version="{VERSION}" generated="{datetime.datetime.now().isoformat()}">')
     for r in results:
-        lines.append(f'  <host target="{r.target}" ip="{r.ip_address}" hostname="{r.hostname}" up="{r.host_up}">')
+        lines.append(
+            f'  <host target="{r.target}" ip="{r.ip_address}" hostname="{r.hostname}" up="{r.host_up}">'
+        )
         if r.os_guess:
             lines.append(f'    <os guess="{_esc(r.os_guess)}" confidence="{r.os_confidence}"/>')
-        lines.append(f'    <scan_info type="{r.scan_type}" duration="{r.scan_duration:.3f}" '
-                     f'open="{r.open_count}" filtered="{r.filtered_count}" closed="{r.closed_count}"/>')
+        lines.append(
+            f'    <scan_info type="{r.scan_type}" duration="{r.scan_duration:.3f}" '
+            f'open="{r.open_count}" filtered="{r.filtered_count}" closed="{r.closed_count}"/>'
+        )
         lines.append("    <ports>")
         for p in r.ports:
             if p.state == PortState.OPEN:
                 ssl_attr = ""
                 if p.ssl_info:
                     ssl_attr = f' ssl_version="{p.ssl_info.get("version", "")}"'
-                lines.append(f'      <port number="{p.port}" protocol="{p.protocol}" state="{p.state.value}" '
-                             f'service="{_esc(p.service)}" version="{_esc(p.version)}" '
-                             f'response_ms="{round(p.response_time*1000,2)}"{ssl_attr}>')
+                lines.append(
+                    f'      <port number="{p.port}" protocol="{p.protocol}" state="{p.state.value}" '
+                    f'service="{_esc(p.service)}" version="{_esc(p.version)}" '
+                    f'response_ms="{round(p.response_time*1000,2)}"{ssl_attr}>'
+                )
                 if p.banner:
-                    lines.append(f'        <banner><![CDATA[{p.banner[:200]}]]></banner>')
+                    lines.append(f"        <banner><![CDATA[{p.banner[:200]}]]></banner>")
                 lines.append("      </port>")
         lines.append("    </ports>")
         lines.append("  </host>")
@@ -113,7 +140,9 @@ def export_txt(results: List[ScanResult]) -> str:
         if r.os_guess:
             lines.append(f"  OS     : {r.os_guess} ({r.os_confidence}% confidence)")
         lines.append(f"  Scan   : {r.scan_type}  |  Duration: {r.scan_duration:.2f}s")
-        lines.append(f"  Open: {r.open_count}  Filtered: {r.filtered_count}  Closed: {r.closed_count}")
+        lines.append(
+            f"  Open: {r.open_count}  Filtered: {r.filtered_count}  Closed: {r.closed_count}"
+        )
         lines.append(thin)
 
         open_ports = [p for p in r.ports if p.state == PortState.OPEN]
@@ -128,7 +157,9 @@ def export_txt(results: List[ScanResult]) -> str:
                     short_banner = p.banner.splitlines()[0][:60]
                     lines.append(f"  {'':10} {'':6} Banner: {short_banner}")
                 if p.ssl_info:
-                    lines.append(f"  {'':10} {'':6} SSL: {p.ssl_info.get('version','')}  CN={p.ssl_info.get('common_name','')}")
+                    lines.append(
+                        f"  {'':10} {'':6} SSL: {p.ssl_info.get('version','')}  CN={p.ssl_info.get('common_name','')}"
+                    )
         else:
             lines.append("  No open ports found.")
         lines.append("")
@@ -163,9 +194,15 @@ def export_html(results: List[ScanResult]) -> str:
               <td>{round(p.response_time*1000,1)}ms</td>
             </tr>"""
         if not port_rows:
-            port_rows = '<tr><td colspan="7" style="text-align:center;color:#666">No open ports</td></tr>'
+            port_rows = (
+                '<tr><td colspan="7" style="text-align:center;color:#666">No open ports</td></tr>'
+            )
 
-        os_info = f'<div class="os-badge">{_esc(r.os_guess)} ({r.os_confidence}%)</div>' if r.os_guess else ""
+        os_info = (
+            f'<div class="os-badge">{_esc(r.os_guess)} ({r.os_confidence}%)</div>'
+            if r.os_guess
+            else ""
+        )
         status_cls = "up" if r.host_up else "down"
         rows.append(f"""
     <div class="host-card">
@@ -261,4 +298,10 @@ def export_html(results: List[ScanResult]) -> str:
 
 def _esc(s: str) -> str:
     """HTML escape."""
-    return (s or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;")
+    return (
+        (s or "")
+        .replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace('"', "&quot;")
+    )

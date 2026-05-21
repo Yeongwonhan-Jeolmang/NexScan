@@ -3,61 +3,74 @@ NexScan GUI — Main Application Window
 Dark terminal-inspired professional port scanner interface.
 """
 
-import tkinter as tk
-from tkinter import ttk, messagebox, filedialog
-import threading
-import time
+from collections import defaultdict
 import datetime
+import ipaddress
 import json
 import os
-import sys
 import queue
 import socket
-import ipaddress
-from collections import defaultdict
+import sys
+import threading
+import time
+import tkinter as tk
+from tkinter import filedialog, messagebox, ttk
+
+from core.scanner import (
+    PortResult,
+    PortScanner,
+    PortState,
+    ScanConfig,
+    ScanResult,
+    ScanType,
+    parse_ports,
+    parse_targets,
+)
+from core.service_db import COMMON_PORTS, ServiceDatabase
+from reports.exporter import (
+    export_csv,
+    export_html,
+    export_json,
+    export_txt,
+    export_xml,
+)
 
 # Add parent dir to path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from core.scanner import (
-    PortScanner, ScanConfig, ScanType, PortState,
-    ScanResult, PortResult, parse_ports, parse_targets
-)
-from core.service_db import ServiceDatabase, COMMON_PORTS
-from reports.exporter import export_json, export_csv, export_xml, export_txt, export_html
 
 # ─────────────────────────── COLOR PALETTE ───────────────────────────
 C = {
-    "bg":         "#0b0e14",
-    "surface":    "#111620",
-    "surface2":   "#161c2a",
-    "border":     "#1e2840",
-    "border2":    "#253050",
-    "accent":     "#00d4ff",
-    "accent2":    "#0099bb",
+    "bg": "#0b0e14",
+    "surface": "#111620",
+    "surface2": "#161c2a",
+    "border": "#1e2840",
+    "border2": "#253050",
+    "accent": "#00d4ff",
+    "accent2": "#0099bb",
     "accent_dim": "#004455",
-    "green":      "#00ff88",
-    "green_dim":  "#003322",
-    "yellow":     "#ffcc00",
+    "green": "#00ff88",
+    "green_dim": "#003322",
+    "yellow": "#ffcc00",
     "yellow_dim": "#332800",
-    "red":        "#ff4466",
-    "red_dim":    "#330011",
-    "purple":     "#bb66ff",
+    "red": "#ff4466",
+    "red_dim": "#330011",
+    "purple": "#bb66ff",
     "purple_dim": "#220033",
-    "orange":     "#ff8822",
-    "text":       "#ccd6f6",
-    "text2":      "#7888aa",
-    "text3":      "#445566",
-    "white":      "#e8f0ff",
-    "header_bg":  "#0d1220",
-    "row_alt":    "#0f1520",
-    "row_hover":  "#152030",
-    "select":     "#1a3050",
-    "input_bg":   "#0d1525",
-    "btn_bg":     "#0d1a2e",
-    "btn_hover":  "#1a2d48",
-    "tag_open":   "#003322",
-    "tag_filt":   "#332800",
+    "orange": "#ff8822",
+    "text": "#ccd6f6",
+    "text2": "#7888aa",
+    "text3": "#445566",
+    "white": "#e8f0ff",
+    "header_bg": "#0d1220",
+    "row_alt": "#0f1520",
+    "row_hover": "#152030",
+    "select": "#1a3050",
+    "input_bg": "#0d1525",
+    "btn_bg": "#0d1a2e",
+    "btn_hover": "#1a2d48",
+    "tag_open": "#003322",
+    "tag_filt": "#332800",
     "tag_closed": "#1a1a2a",
 }
 
@@ -98,73 +111,126 @@ class NexScanApp(tk.Tk):
         style.theme_use("clam")
 
         # Treeview
-        style.configure("Treeview",
-            background=C["surface"], foreground=C["text"],
-            fieldbackground=C["surface"], borderwidth=0,
-            rowheight=26, font=FONT_MONO_SM)
-        style.configure("Treeview.Heading",
-            background=C["header_bg"], foreground=C["accent"],
-            borderwidth=0, relief="flat", font=FONT_MONO_SM)
-        style.map("Treeview",
+        style.configure(
+            "Treeview",
+            background=C["surface"],
+            foreground=C["text"],
+            fieldbackground=C["surface"],
+            borderwidth=0,
+            rowheight=26,
+            font=FONT_MONO_SM,
+        )
+        style.configure(
+            "Treeview.Heading",
+            background=C["header_bg"],
+            foreground=C["accent"],
+            borderwidth=0,
+            relief="flat",
+            font=FONT_MONO_SM,
+        )
+        style.map(
+            "Treeview",
             background=[("selected", C["select"])],
-            foreground=[("selected", C["white"])])
-        style.map("Treeview.Heading",
-            background=[("active", C["border"])])
+            foreground=[("selected", C["white"])],
+        )
+        style.map("Treeview.Heading", background=[("active", C["border"])])
 
         # Scrollbars
-        style.configure("Vertical.TScrollbar",
-            background=C["surface2"], troughcolor=C["bg"],
-            borderwidth=0, arrowsize=12, width=10)
-        style.configure("Horizontal.TScrollbar",
-            background=C["surface2"], troughcolor=C["bg"],
-            borderwidth=0, arrowsize=12, width=10)
+        style.configure(
+            "Vertical.TScrollbar",
+            background=C["surface2"],
+            troughcolor=C["bg"],
+            borderwidth=0,
+            arrowsize=12,
+            width=10,
+        )
+        style.configure(
+            "Horizontal.TScrollbar",
+            background=C["surface2"],
+            troughcolor=C["bg"],
+            borderwidth=0,
+            arrowsize=12,
+            width=10,
+        )
 
         # Progressbar
-        style.configure("Scan.Horizontal.TProgressbar",
-            background=C["accent"], troughcolor=C["surface2"],
-            borderwidth=0, thickness=6)
+        style.configure(
+            "Scan.Horizontal.TProgressbar",
+            background=C["accent"],
+            troughcolor=C["surface2"],
+            borderwidth=0,
+            thickness=6,
+        )
 
         # Notebook tabs
         style.configure("TNotebook", background=C["bg"], borderwidth=0)
-        style.configure("TNotebook.Tab",
-            background=C["surface2"], foreground=C["text2"],
-            padding=[14, 8], font=FONT_MONO_SM, borderwidth=0)
-        style.map("TNotebook.Tab",
+        style.configure(
+            "TNotebook.Tab",
+            background=C["surface2"],
+            foreground=C["text2"],
+            padding=[14, 8],
+            font=FONT_MONO_SM,
+            borderwidth=0,
+        )
+        style.map(
+            "TNotebook.Tab",
             background=[("selected", C["surface"]), ("active", C["border"])],
-            foreground=[("selected", C["accent"]), ("active", C["text"])])
+            foreground=[("selected", C["accent"]), ("active", C["text"])],
+        )
 
         # Separators
         style.configure("TSeparator", background=C["border"])
 
         # Combobox
-        style.configure("TCombobox",
-            fieldbackground=C["input_bg"], background=C["surface2"],
-            foreground=C["text"], selectbackground=C["select"],
-            bordercolor=C["border2"], arrowsize=12)
-        style.map("TCombobox",
+        style.configure(
+            "TCombobox",
+            fieldbackground=C["input_bg"],
+            background=C["surface2"],
+            foreground=C["text"],
+            selectbackground=C["select"],
+            bordercolor=C["border2"],
+            arrowsize=12,
+        )
+        style.map(
+            "TCombobox",
             fieldbackground=[("readonly", C["input_bg"])],
-            foreground=[("readonly", C["text"])])
+            foreground=[("readonly", C["text"])],
+        )
 
         # Spinbox
-        style.configure("TSpinbox",
-            fieldbackground=C["input_bg"], background=C["surface2"],
-            foreground=C["text"], bordercolor=C["border2"])
+        style.configure(
+            "TSpinbox",
+            fieldbackground=C["input_bg"],
+            background=C["surface2"],
+            foreground=C["text"],
+            bordercolor=C["border2"],
+        )
 
         # Checkbutton
-        style.configure("TCheckbutton",
-            background=C["surface2"], foreground=C["text"],
-            focuscolor=C["accent"])
-        style.map("TCheckbutton",
+        style.configure(
+            "TCheckbutton", background=C["surface2"], foreground=C["text"], focuscolor=C["accent"]
+        )
+        style.map(
+            "TCheckbutton",
             background=[("active", C["surface2"])],
-            foreground=[("active", C["white"])])
+            foreground=[("active", C["white"])],
+        )
 
         # Labelframe
-        style.configure("Card.TLabelframe",
-            background=C["surface2"], foreground=C["accent"],
-            bordercolor=C["border2"], relief="solid", borderwidth=1)
-        style.configure("Card.TLabelframe.Label",
-            background=C["surface2"], foreground=C["accent"],
-            font=FONT_MONO_SM)
+        style.configure(
+            "Card.TLabelframe",
+            background=C["surface2"],
+            foreground=C["accent"],
+            bordercolor=C["border2"],
+            relief="solid",
+            borderwidth=1,
+        )
+        style.configure(
+            "Card.TLabelframe.Label",
+            background=C["surface2"],
+            foreground=C["accent"],
+            font=FONT_MONO_SM,
+        )
 
     def _init_state(self):
         self.service_db = ServiceDatabase()
@@ -215,12 +281,12 @@ class NexScanApp(tk.Tk):
         bar.pack_propagate(False)
 
         # Logo
-        logo = tk.Label(bar, text="◈ NEXSCAN", font=FONT_TITLE,
-                        bg=C["header_bg"], fg=C["accent"])
+        logo = tk.Label(bar, text="◈ NEXSCAN", font=FONT_TITLE, bg=C["header_bg"], fg=C["accent"])
         logo.pack(side="left", padx=20, pady=10)
 
-        ver = tk.Label(bar, text=f"v{self.VERSION}", font=FONT_MONO_SM,
-                       bg=C["header_bg"], fg=C["text3"])
+        ver = tk.Label(
+            bar, text=f"v{self.VERSION}", font=FONT_MONO_SM, bg=C["header_bg"], fg=C["text3"]
+        )
         ver.pack(side="left", pady=10)
 
         # Separator
@@ -234,8 +300,9 @@ class NexScanApp(tk.Tk):
             ("■  STOP", self._stop_scan, C["red"]),
             ("⟳  CLEAR", self._clear_results, C["text2"]),
         ]:
-            btn = self._make_button(bar, text, cmd, fg=fg, bg=C["btn_bg"],
-                                    hover_bg=C["btn_hover"], pad=(14, 6))
+            btn = self._make_button(
+                bar, text, cmd, fg=fg, bg=C["btn_bg"], hover_bg=C["btn_hover"], pad=(14, 6)
+            )
             btn.pack(side="left", padx=4, pady=10)
 
         # Right side: export + settings
@@ -245,22 +312,25 @@ class NexScanApp(tk.Tk):
             ("⬇  EXPORT", self._export_menu, C["purple"]),
             ("✦  ABOUT", self._show_about, C["text2"]),
         ]:
-            btn = self._make_button(bar, text, cmd, fg=fg, bg=C["btn_bg"],
-                                    hover_bg=C["btn_hover"], pad=(14, 6))
+            btn = self._make_button(
+                bar, text, cmd, fg=fg, bg=C["btn_bg"], hover_bg=C["btn_hover"], pad=(14, 6)
+            )
             btn.pack(side="right", padx=4, pady=10)
 
         # Scan elapsed timer label
-        self.lbl_timer = tk.Label(bar, text="00:00:00", font=FONT_MONO_LG,
-                                  bg=C["header_bg"], fg=C["text3"])
+        self.lbl_timer = tk.Label(
+            bar, text="00:00:00", font=FONT_MONO_LG, bg=C["header_bg"], fg=C["text3"]
+        )
         self.lbl_timer.pack(side="right", padx=16)
-        self.lbl_timer_icon = tk.Label(bar, text="⏱", font=FONT_MONO_SM,
-                                       bg=C["header_bg"], fg=C["text3"])
+        self.lbl_timer_icon = tk.Label(
+            bar, text="⏱", font=FONT_MONO_SM, bg=C["header_bg"], fg=C["text3"]
+        )
         self.lbl_timer_icon.pack(side="right")
 
     def _build_main(self):
-        main = tk.PanedWindow(self, orient="horizontal",
-                              bg=C["border"], sashwidth=4,
-                              sashrelief="flat", handlesize=0)
+        main = tk.PanedWindow(
+            self, orient="horizontal", bg=C["border"], sashwidth=4, sashrelief="flat", handlesize=0
+        )
         main.pack(fill="both", expand=True, padx=0, pady=0)
 
         # Left panel
@@ -276,20 +346,34 @@ class NexScanApp(tk.Tk):
 
         # ── Target input ──
         sec = self._section(frame, "TARGET")
-        self.txt_targets = tk.Text(sec, height=4, bg=C["input_bg"],
-                                    fg=C["text"], font=FONT_MONO_SM,
-                                    insertbackground=C["accent"],
-                                    relief="flat", bd=0,
-                                    highlightthickness=1,
-                                    highlightcolor=C["accent2"],
-                                    highlightbackground=C["border2"],
-                                    wrap="none", padx=6, pady=6)
+        self.txt_targets = tk.Text(
+            sec,
+            height=4,
+            bg=C["input_bg"],
+            fg=C["text"],
+            font=FONT_MONO_SM,
+            insertbackground=C["accent"],
+            relief="flat",
+            bd=0,
+            highlightthickness=1,
+            highlightcolor=C["accent2"],
+            highlightbackground=C["border2"],
+            wrap="none",
+            padx=6,
+            pady=6,
+        )
         self.txt_targets.insert("1.0", "192.168.1.1")
         self.txt_targets.pack(fill="x", padx=8, pady=(0, 6))
 
-        hint = tk.Label(sec, text="Single IP, range (192.168.1.1-50), CIDR, or hostname. One per line or comma-separated.",
-                        bg=C["surface2"], fg=C["text3"], font=("Consolas", 8),
-                        wraplength=300, justify="left")
+        hint = tk.Label(
+            sec,
+            text="Single IP, range (192.168.1.1-50), CIDR, or hostname. One per line or comma-separated.",
+            bg=C["surface2"],
+            fg=C["text3"],
+            font=("Consolas", 8),
+            wraplength=300,
+            justify="left",
+        )
         hint.pack(fill="x", padx=8, pady=(0, 6))
 
         # ── Port config ──
@@ -298,54 +382,104 @@ class NexScanApp(tk.Tk):
         # Preset selector
         prow = tk.Frame(sec2, bg=C["surface2"])
         prow.pack(fill="x", padx=8, pady=(0, 4))
-        tk.Label(prow, text="Preset:", bg=C["surface2"], fg=C["text2"],
-                 font=FONT_MONO_SM).pack(side="left")
+        tk.Label(prow, text="Preset:", bg=C["surface2"], fg=C["text2"], font=FONT_MONO_SM).pack(
+            side="left"
+        )
         presets = self.service_db.get_presets()
-        cb = ttk.Combobox(prow, textvariable=self.var_port_preset,
-                          values=presets, state="readonly", width=18,
-                          font=FONT_MONO_SM)
+        cb = ttk.Combobox(
+            prow,
+            textvariable=self.var_port_preset,
+            values=presets,
+            state="readonly",
+            width=18,
+            font=FONT_MONO_SM,
+        )
         cb.pack(side="left", padx=6)
         cb.bind("<<ComboboxSelected>>", self._apply_port_preset)
 
-        self._make_button(prow, "Apply", self._apply_port_preset,
-                          fg=C["accent"], bg=C["btn_bg"],
-                          hover_bg=C["btn_hover"], pad=(8, 2)).pack(side="left", padx=4)
+        self._make_button(
+            prow,
+            "Apply",
+            self._apply_port_preset,
+            fg=C["accent"],
+            bg=C["btn_bg"],
+            hover_bg=C["btn_hover"],
+            pad=(8, 2),
+        ).pack(side="left", padx=4)
 
-        tk.Label(sec2, text="Port range / list:", bg=C["surface2"],
-                 fg=C["text2"], font=FONT_MONO_SM).pack(anchor="w", padx=8)
+        tk.Label(
+            sec2, text="Port range / list:", bg=C["surface2"], fg=C["text2"], font=FONT_MONO_SM
+        ).pack(anchor="w", padx=8)
 
-        self.txt_ports = tk.Text(sec2, height=3, bg=C["input_bg"],
-                                  fg=C["text"], font=FONT_MONO_SM,
-                                  insertbackground=C["accent"],
-                                  relief="flat", bd=0,
-                                  highlightthickness=1,
-                                  highlightcolor=C["accent2"],
-                                  highlightbackground=C["border2"],
-                                  wrap="none", padx=6, pady=6)
-        self.txt_ports.insert("1.0", "21,22,23,25,53,80,110,135,139,143,443,445,993,995,1433,1521,3306,3389,5432,5900,8080,8443,27017")
+        self.txt_ports = tk.Text(
+            sec2,
+            height=3,
+            bg=C["input_bg"],
+            fg=C["text"],
+            font=FONT_MONO_SM,
+            insertbackground=C["accent"],
+            relief="flat",
+            bd=0,
+            highlightthickness=1,
+            highlightcolor=C["accent2"],
+            highlightbackground=C["border2"],
+            wrap="none",
+            padx=6,
+            pady=6,
+        )
+        self.txt_ports.insert(
+            "1.0",
+            "21,22,23,25,53,80,110,135,139,143,443,445,993,995,1433,1521,3306,3389,5432,5900,8080,8443,27017",
+        )
         self.txt_ports.pack(fill="x", padx=8, pady=(2, 6))
 
-        phint = tk.Label(sec2, text="e.g.: 22,80,443  or  1-1024  or  80,443,8000-9000",
-                         bg=C["surface2"], fg=C["text3"], font=("Consolas", 8))
+        phint = tk.Label(
+            sec2,
+            text="e.g.: 22,80,443  or  1-1024  or  80,443,8000-9000",
+            bg=C["surface2"],
+            fg=C["text3"],
+            font=("Consolas", 8),
+        )
         phint.pack(anchor="w", padx=8, pady=(0, 6))
 
         # ── Scan Type ──
         sec3 = self._section(frame, "SCAN TYPE")
-        scan_types = ["TCP Connect", "UDP", "SYN Stealth*", "ACK*", "FIN*", "XMAS*", "NULL*", "Window*"]
+        scan_types = [
+            "TCP Connect",
+            "UDP",
+            "SYN Stealth*",
+            "ACK*",
+            "FIN*",
+            "XMAS*",
+            "NULL*",
+            "Window*",
+        ]
         for i, st in enumerate(scan_types):
             needs_root = st.endswith("*")
             fg = C["text2"] if needs_root else C["text"]
-            rb = tk.Radiobutton(sec3, text=st, variable=self.var_scan_type,
-                                value=st, bg=C["surface2"], fg=fg,
-                                selectcolor=C["accent_dim"], activebackground=C["surface2"],
-                                activeforeground=C["white"], font=FONT_MONO_SM,
-                                cursor="hand2" if not needs_root else "arrow",
-                                indicatoron=True)
+            rb = tk.Radiobutton(
+                sec3,
+                text=st,
+                variable=self.var_scan_type,
+                value=st,
+                bg=C["surface2"],
+                fg=fg,
+                selectcolor=C["accent_dim"],
+                activebackground=C["surface2"],
+                activeforeground=C["white"],
+                font=FONT_MONO_SM,
+                cursor="hand2" if not needs_root else "arrow",
+                indicatoron=True,
+            )
             rb.pack(anchor="w", padx=8, pady=1)
 
-        tk.Label(sec3, text="* Requires root/admin privileges",
-                 bg=C["surface2"], fg=C["text3"],
-                 font=("Consolas", 8)).pack(anchor="w", padx=8, pady=(2, 6))
+        tk.Label(
+            sec3,
+            text="* Requires root/admin privileges",
+            bg=C["surface2"],
+            fg=C["text3"],
+            font=("Consolas", 8),
+        ).pack(anchor="w", padx=8, pady=(2, 6))
 
         # ── Settings tabs ──
         sec4 = self._section(frame, "SETTINGS")
@@ -372,16 +506,25 @@ class NexScanApp(tk.Tk):
         for label, var, mn, mx, hint in items:
             row = tk.Frame(tab, bg=C["surface2"])
             row.pack(fill="x", padx=8, pady=3)
-            tk.Label(row, text=label, bg=C["surface2"], fg=C["text2"],
-                     font=FONT_MONO_SM, width=20, anchor="w").pack(side="left")
+            tk.Label(
+                row,
+                text=label,
+                bg=C["surface2"],
+                fg=C["text2"],
+                font=FONT_MONO_SM,
+                width=20,
+                anchor="w",
+            ).pack(side="left")
             is_int = isinstance(var, tk.IntVar)
             inc = 1 if is_int else 0.1
-            sp = ttk.Spinbox(row, from_=mn, to=mx, textvariable=var,
-                             width=8, font=FONT_MONO_SM, increment=inc)
+            sp = ttk.Spinbox(
+                row, from_=mn, to=mx, textvariable=var, width=8, font=FONT_MONO_SM, increment=inc
+            )
             sp.pack(side="left", padx=4)
             if hint:
-                tk.Label(row, text=hint, bg=C["surface2"], fg=C["text3"],
-                         font=("Consolas", 8)).pack(side="left")
+                tk.Label(
+                    row, text=hint, bg=C["surface2"], fg=C["text3"], font=("Consolas", 8)
+                ).pack(side="left")
 
     def _build_output_tab(self, notebook):
         tab = tk.Frame(notebook, bg=C["surface2"])
@@ -397,8 +540,9 @@ class NexScanApp(tk.Tk):
             ("Show Closed Ports", self.var_show_closed),
         ]
         for label, var in checks:
-            ttk.Checkbutton(tab, text=label, variable=var,
-                            style="TCheckbutton").pack(anchor="w", padx=10, pady=2)
+            ttk.Checkbutton(tab, text=label, variable=var, style="TCheckbutton").pack(
+                anchor="w", padx=10, pady=2
+            )
 
     def _build_advanced_tab(self, notebook):
         tab = tk.Frame(notebook, bg=C["surface2"])
@@ -408,47 +552,89 @@ class NexScanApp(tk.Tk):
         jrow = tk.Frame(tab, bg=C["surface2"])
         jrow.pack(fill="x", padx=8, pady=3)
         self.var_jitter = tk.DoubleVar(value=0.0)
-        tk.Label(jrow, text="Jitter (ms)", bg=C["surface2"], fg=C["text2"],
-                 font=FONT_MONO_SM, width=20, anchor="w").pack(side="left")
-        ttk.Spinbox(jrow, from_=0, to=5000, textvariable=self.var_jitter,
-                    width=8, font=FONT_MONO_SM, increment=10).pack(side="left", padx=4)
+        tk.Label(
+            jrow,
+            text="Jitter (ms)",
+            bg=C["surface2"],
+            fg=C["text2"],
+            font=FONT_MONO_SM,
+            width=20,
+            anchor="w",
+        ).pack(side="left")
+        ttk.Spinbox(
+            jrow,
+            from_=0,
+            to=5000,
+            textvariable=self.var_jitter,
+            width=8,
+            font=FONT_MONO_SM,
+            increment=10,
+        ).pack(side="left", padx=4)
 
         # Max banner wait
         brow = tk.Frame(tab, bg=C["surface2"])
         brow.pack(fill="x", padx=8, pady=3)
         self.var_max_banner = tk.DoubleVar(value=2.0)
-        tk.Label(brow, text="Banner Wait (s)", bg=C["surface2"], fg=C["text2"],
-                 font=FONT_MONO_SM, width=20, anchor="w").pack(side="left")
-        ttk.Spinbox(brow, from_=0.1, to=10.0, textvariable=self.var_max_banner,
-                    width=8, font=FONT_MONO_SM, increment=0.1).pack(side="left", padx=4)
+        tk.Label(
+            brow,
+            text="Banner Wait (s)",
+            bg=C["surface2"],
+            fg=C["text2"],
+            font=FONT_MONO_SM,
+            width=20,
+            anchor="w",
+        ).pack(side="left")
+        ttk.Spinbox(
+            brow,
+            from_=0.1,
+            to=10.0,
+            textvariable=self.var_max_banner,
+            width=8,
+            font=FONT_MONO_SM,
+            increment=0.1,
+        ).pack(side="left", padx=4)
 
         # UDP probes
         self.var_udp_probes = tk.BooleanVar(value=True)
-        ttk.Checkbutton(tab, text="UDP Service Probes",
-                        variable=self.var_udp_probes).pack(anchor="w", padx=10, pady=3)
+        ttk.Checkbutton(tab, text="UDP Service Probes", variable=self.var_udp_probes).pack(
+            anchor="w", padx=10, pady=3
+        )
 
         # Quick resolve
         self.var_quick_resolve = tk.BooleanVar(value=True)
-        ttk.Checkbutton(tab, text="DNS Reverse Lookup",
-                        variable=self.var_quick_resolve).pack(anchor="w", padx=10, pady=3)
+        ttk.Checkbutton(tab, text="DNS Reverse Lookup", variable=self.var_quick_resolve).pack(
+            anchor="w", padx=10, pady=3
+        )
 
         # Resolve button
         rrow = tk.Frame(tab, bg=C["surface2"])
         rrow.pack(fill="x", padx=8, pady=6)
-        self._make_button(rrow, "Resolve Targets Now", self._resolve_targets,
-                          fg=C["accent"], bg=C["btn_bg"],
-                          hover_bg=C["btn_hover"], pad=(8, 4)).pack(side="left")
+        self._make_button(
+            rrow,
+            "Resolve Targets Now",
+            self._resolve_targets,
+            fg=C["accent"],
+            bg=C["btn_bg"],
+            hover_bg=C["btn_hover"],
+            pad=(8, 4),
+        ).pack(side="left")
 
         # Port count display
         crow = tk.Frame(tab, bg=C["surface2"])
         crow.pack(fill="x", padx=8, pady=3)
-        self.lbl_port_count = tk.Label(crow, text="Ports to scan: —",
-                                       bg=C["surface2"], fg=C["text3"],
-                                       font=FONT_MONO_SM)
+        self.lbl_port_count = tk.Label(
+            crow, text="Ports to scan: —", bg=C["surface2"], fg=C["text3"], font=FONT_MONO_SM
+        )
         self.lbl_port_count.pack(side="left")
-        self._make_button(crow, "Count", self._count_ports,
-                          fg=C["text2"], bg=C["btn_bg"],
-                          hover_bg=C["btn_hover"], pad=(6, 2)).pack(side="left", padx=4)
+        self._make_button(
+            crow,
+            "Count",
+            self._count_ports,
+            fg=C["text2"],
+            bg=C["btn_bg"],
+            hover_bg=C["btn_hover"],
+            pad=(6, 2),
+        ).pack(side="left", padx=4)
 
     def _build_right_panel(self, parent):
         frame = tk.Frame(parent, bg=C["bg"])
@@ -460,11 +646,13 @@ class NexScanApp(tk.Tk):
         pbar_frame = tk.Frame(frame, bg=C["bg"])
         pbar_frame.pack(fill="x", padx=12, pady=(0, 6))
 
-        self.progress = ttk.Progressbar(pbar_frame, style="Scan.Horizontal.TProgressbar",
-                                         mode="determinate", length=400)
+        self.progress = ttk.Progressbar(
+            pbar_frame, style="Scan.Horizontal.TProgressbar", mode="determinate", length=400
+        )
         self.progress.pack(fill="x", side="left", expand=True)
-        self.lbl_progress = tk.Label(pbar_frame, text="0%", bg=C["bg"],
-                                     fg=C["text3"], font=FONT_MONO_SM, width=6)
+        self.lbl_progress = tk.Label(
+            pbar_frame, text="0%", bg=C["bg"], fg=C["text3"], font=FONT_MONO_SM, width=6
+        )
         self.lbl_progress.pack(side="right", padx=4)
 
         # ── Notebook: Results / Log / SSL / OS ──
@@ -497,11 +685,9 @@ class NexScanApp(tk.Tk):
             inner = tk.Frame(col, bg=C["surface2"])
             inner.pack(fill="both", expand=True, padx=2, pady=4)
 
-            val_lbl = tk.Label(inner, textvariable=var, font=FONT_STAT,
-                               bg=C["surface2"], fg=color)
+            val_lbl = tk.Label(inner, textvariable=var, font=FONT_STAT, bg=C["surface2"], fg=color)
             val_lbl.pack(pady=(8, 0))
-            tk.Label(inner, text=label, font=FONT_MONO_SM,
-                     bg=C["surface2"], fg=C["text3"]).pack()
+            tk.Label(inner, text=label, font=FONT_MONO_SM, bg=C["surface2"], fg=C["text3"]).pack()
 
         # Separator + scan info
         sep = tk.Frame(bar, bg=C["border"], width=1)
@@ -512,14 +698,16 @@ class NexScanApp(tk.Tk):
         inner2 = tk.Frame(info_col, bg=C["surface2"])
         inner2.pack(fill="both", expand=True, padx=2, pady=4)
 
-        tk.Label(inner2, text="STATUS", font=FONT_MONO_SM,
-                 bg=C["surface2"], fg=C["text3"]).pack(pady=(8, 0))
-        self.lbl_status = tk.Label(inner2, text="IDLE", font=FONT_MONO_LG,
-                                   bg=C["surface2"], fg=C["text2"])
+        tk.Label(inner2, text="STATUS", font=FONT_MONO_SM, bg=C["surface2"], fg=C["text3"]).pack(
+            pady=(8, 0)
+        )
+        self.lbl_status = tk.Label(
+            inner2, text="IDLE", font=FONT_MONO_LG, bg=C["surface2"], fg=C["text2"]
+        )
         self.lbl_status.pack()
-        self.lbl_current = tk.Label(inner2, text="—", font=FONT_MONO_SM,
-                                    bg=C["surface2"], fg=C["text3"],
-                                    wraplength=200)
+        self.lbl_current = tk.Label(
+            inner2, text="—", font=FONT_MONO_SM, bg=C["surface2"], fg=C["text3"], wraplength=200
+        )
         self.lbl_current.pack()
 
     def _build_results_tab(self, notebook):
@@ -530,43 +718,62 @@ class NexScanApp(tk.Tk):
         fbar = tk.Frame(tab, bg=C["surface"])
         fbar.pack(fill="x", padx=4, pady=(4, 2))
 
-        tk.Label(fbar, text="🔍 Filter:", bg=C["surface"],
-                 fg=C["text2"], font=FONT_MONO_SM).pack(side="left", padx=8)
-        self.entry_filter = tk.Entry(fbar, textvariable=self.var_filter_text,
-                                     bg=C["input_bg"], fg=C["text"],
-                                     insertbackground=C["accent"],
-                                     relief="flat", bd=0,
-                                     highlightthickness=1,
-                                     highlightcolor=C["accent2"],
-                                     highlightbackground=C["border2"],
-                                     font=FONT_MONO_SM, width=30)
+        tk.Label(fbar, text="🔍 Filter:", bg=C["surface"], fg=C["text2"], font=FONT_MONO_SM).pack(
+            side="left", padx=8
+        )
+        self.entry_filter = tk.Entry(
+            fbar,
+            textvariable=self.var_filter_text,
+            bg=C["input_bg"],
+            fg=C["text"],
+            insertbackground=C["accent"],
+            relief="flat",
+            bd=0,
+            highlightthickness=1,
+            highlightcolor=C["accent2"],
+            highlightbackground=C["border2"],
+            font=FONT_MONO_SM,
+            width=30,
+        )
         self.entry_filter.pack(side="left", padx=4, ipady=4)
 
         # Sort controls
-        tk.Label(fbar, text="Sort:", bg=C["surface"],
-                 fg=C["text2"], font=FONT_MONO_SM).pack(side="left", padx=(12, 4))
+        tk.Label(fbar, text="Sort:", bg=C["surface"], fg=C["text2"], font=FONT_MONO_SM).pack(
+            side="left", padx=(12, 4)
+        )
         sort_opts = ["Port ↑", "Port ↓", "Service", "Response Time", "State"]
         self.var_sort = tk.StringVar(value="Port ↑")
-        sort_cb = ttk.Combobox(fbar, textvariable=self.var_sort,
-                               values=sort_opts, state="readonly",
-                               width=14, font=FONT_MONO_SM)
+        sort_cb = ttk.Combobox(
+            fbar,
+            textvariable=self.var_sort,
+            values=sort_opts,
+            state="readonly",
+            width=14,
+            font=FONT_MONO_SM,
+        )
         sort_cb.pack(side="left", padx=4)
         sort_cb.bind("<<ComboboxSelected>>", lambda e: self._refresh_results_view())
 
         # Host filter
-        tk.Label(fbar, text="Host:", bg=C["surface"],
-                 fg=C["text2"], font=FONT_MONO_SM).pack(side="left", padx=(12, 4))
+        tk.Label(fbar, text="Host:", bg=C["surface"], fg=C["text2"], font=FONT_MONO_SM).pack(
+            side="left", padx=(12, 4)
+        )
         self.var_host_filter = tk.StringVar(value="All")
-        self.cb_host_filter = ttk.Combobox(fbar, textvariable=self.var_host_filter,
-                                            values=["All"], state="readonly",
-                                            width=18, font=FONT_MONO_SM)
+        self.cb_host_filter = ttk.Combobox(
+            fbar,
+            textvariable=self.var_host_filter,
+            values=["All"],
+            state="readonly",
+            width=18,
+            font=FONT_MONO_SM,
+        )
         self.cb_host_filter.pack(side="left", padx=4)
         self.cb_host_filter.bind("<<ComboboxSelected>>", lambda e: self._refresh_results_view())
 
         # Count label
-        self.lbl_result_count = tk.Label(fbar, text="0 results",
-                                         bg=C["surface"], fg=C["text3"],
-                                         font=FONT_MONO_SM)
+        self.lbl_result_count = tk.Label(
+            fbar, text="0 results", bg=C["surface"], fg=C["text3"], font=FONT_MONO_SM
+        )
         self.lbl_result_count.pack(side="right", padx=12)
 
         # Treeview
@@ -577,12 +784,10 @@ class NexScanApp(tk.Tk):
         tree_frame = tk.Frame(tab, bg=C["bg"])
         tree_frame.pack(fill="both", expand=True, padx=4, pady=(0, 4))
 
-        self.tree = ttk.Treeview(tree_frame, columns=cols, show="headings",
-                                  selectmode="extended")
+        self.tree = ttk.Treeview(tree_frame, columns=cols, show="headings", selectmode="extended")
 
         for col, lbl, w in zip(cols, col_labels, col_widths):
-            self.tree.heading(col, text=lbl,
-                              command=lambda c=col: self._sort_tree(c))
+            self.tree.heading(col, text=lbl, command=lambda c=col: self._sort_tree(c))
             self.tree.column(col, width=w, minwidth=40, anchor="w")
 
         # Scrollbars
@@ -614,33 +819,55 @@ class NexScanApp(tk.Tk):
 
         self.var_log_level = tk.StringVar(value="All")
         for lbl, val in [("All", "All"), ("Open Only", "Open"), ("Errors", "Error")]:
-            rb = tk.Radiobutton(ctrl, text=lbl, variable=self.var_log_level,
-                                value=val, bg=C["surface"], fg=C["text2"],
-                                selectcolor=C["accent_dim"],
-                                activebackground=C["surface"],
-                                activeforeground=C["white"],
-                                font=FONT_MONO_SM, cursor="hand2")
+            rb = tk.Radiobutton(
+                ctrl,
+                text=lbl,
+                variable=self.var_log_level,
+                value=val,
+                bg=C["surface"],
+                fg=C["text2"],
+                selectcolor=C["accent_dim"],
+                activebackground=C["surface"],
+                activeforeground=C["white"],
+                font=FONT_MONO_SM,
+                cursor="hand2",
+            )
             rb.pack(side="left", padx=8, pady=4)
 
-        self._make_button(ctrl, "Clear Log", self._clear_log,
-                          fg=C["text2"], bg=C["btn_bg"],
-                          hover_bg=C["btn_hover"], pad=(8, 3)).pack(side="right", padx=8)
+        self._make_button(
+            ctrl,
+            "Clear Log",
+            self._clear_log,
+            fg=C["text2"],
+            bg=C["btn_bg"],
+            hover_bg=C["btn_hover"],
+            pad=(8, 3),
+        ).pack(side="right", padx=8)
 
         self.var_autoscroll = tk.BooleanVar(value=True)
-        ttk.Checkbutton(ctrl, text="Auto-scroll",
-                        variable=self.var_autoscroll).pack(side="right", padx=4)
+        ttk.Checkbutton(ctrl, text="Auto-scroll", variable=self.var_autoscroll).pack(
+            side="right", padx=4
+        )
 
         # Log text area
         log_frame = tk.Frame(tab, bg=C["bg"])
         log_frame.pack(fill="both", expand=True, padx=4, pady=(0, 4))
 
-        self.txt_log = tk.Text(log_frame, bg=C["bg"], fg=C["text"],
-                               font=FONT_MONO_SM, state="disabled",
-                               relief="flat", bd=0,
-                               highlightthickness=1,
-                               highlightbackground=C["border"],
-                               insertbackground=C["accent"],
-                               wrap="none", padx=8, pady=6)
+        self.txt_log = tk.Text(
+            log_frame,
+            bg=C["bg"],
+            fg=C["text"],
+            font=FONT_MONO_SM,
+            state="disabled",
+            relief="flat",
+            bd=0,
+            highlightthickness=1,
+            highlightbackground=C["border"],
+            insertbackground=C["accent"],
+            wrap="none",
+            padx=8,
+            pady=6,
+        )
 
         log_vsb = ttk.Scrollbar(log_frame, orient="vertical", command=self.txt_log.yview)
         log_hsb = ttk.Scrollbar(log_frame, orient="horizontal", command=self.txt_log.xview)
@@ -666,22 +893,28 @@ class NexScanApp(tk.Tk):
         notebook.add(tab, text="  Port Detail  ")
 
         # Left: host tree
-        pw = tk.PanedWindow(tab, orient="horizontal", bg=C["border"],
-                            sashwidth=3, handlesize=0)
+        pw = tk.PanedWindow(tab, orient="horizontal", bg=C["border"], sashwidth=3, handlesize=0)
         pw.pack(fill="both", expand=True)
 
         left = tk.Frame(pw, bg=C["surface"])
         pw.add(left, minsize=200, width=240)
 
-        tk.Label(left, text="HOSTS", bg=C["surface"], fg=C["accent"],
-                 font=FONT_MONO_SM).pack(anchor="w", padx=8, pady=4)
+        tk.Label(left, text="HOSTS", bg=C["surface"], fg=C["accent"], font=FONT_MONO_SM).pack(
+            anchor="w", padx=8, pady=4
+        )
 
-        self.host_listbox = tk.Listbox(left, bg=C["surface2"], fg=C["text"],
-                                        font=FONT_MONO_SM, selectbackground=C["select"],
-                                        selectforeground=C["white"],
-                                        relief="flat", bd=0,
-                                        highlightthickness=0,
-                                        activestyle="none")
+        self.host_listbox = tk.Listbox(
+            left,
+            bg=C["surface2"],
+            fg=C["text"],
+            font=FONT_MONO_SM,
+            selectbackground=C["select"],
+            selectforeground=C["white"],
+            relief="flat",
+            bd=0,
+            highlightthickness=0,
+            activestyle="none",
+        )
         self.host_listbox.pack(fill="both", expand=True, padx=4, pady=4)
         self.host_listbox.bind("<<ListboxSelect>>", self._on_host_select)
 
@@ -689,11 +922,19 @@ class NexScanApp(tk.Tk):
         right = tk.Frame(pw, bg=C["bg"])
         pw.add(right, minsize=400)
 
-        self.detail_text = tk.Text(right, bg=C["bg"], fg=C["text"],
-                                   font=FONT_MONO_SM, state="disabled",
-                                   relief="flat", bd=0,
-                                   highlightthickness=0,
-                                   wrap="none", padx=12, pady=8)
+        self.detail_text = tk.Text(
+            right,
+            bg=C["bg"],
+            fg=C["text"],
+            font=FONT_MONO_SM,
+            state="disabled",
+            relief="flat",
+            bd=0,
+            highlightthickness=0,
+            wrap="none",
+            padx=12,
+            pady=8,
+        )
 
         det_vsb = ttk.Scrollbar(right, orient="vertical", command=self.detail_text.yview)
         det_hsb = ttk.Scrollbar(right, orient="horizontal", command=self.detail_text.xview)
@@ -705,11 +946,16 @@ class NexScanApp(tk.Tk):
 
         # Detail text tags
         for tag, fg_color in [
-            ("header", C["accent"]), ("subheader", C["purple"]),
-            ("key", C["text2"]), ("value", C["text"]),
-            ("open", C["green"]), ("filtered", C["yellow"]),
-            ("closed", C["text3"]), ("banner_text", C["orange"]),
-            ("ssl_text", C["accent2"]), ("sep", C["border2"]),
+            ("header", C["accent"]),
+            ("subheader", C["purple"]),
+            ("key", C["text2"]),
+            ("value", C["text"]),
+            ("open", C["green"]),
+            ("filtered", C["yellow"]),
+            ("closed", C["text3"]),
+            ("banner_text", C["orange"]),
+            ("ssl_text", C["accent2"]),
+            ("sep", C["border2"]),
         ]:
             self.detail_text.tag_configure(tag, foreground=fg_color)
         self.detail_text.tag_configure("bold", font=("Consolas", 10, "bold"))
@@ -723,17 +969,30 @@ class NexScanApp(tk.Tk):
         stats_frame = tk.Frame(tab, bg=C["bg"])
         stats_frame.pack(fill="both", expand=True, padx=8, pady=8)
 
-        self.stats_text = tk.Text(stats_frame, bg=C["bg"], fg=C["text"],
-                                   font=FONT_MONO_SM, state="disabled",
-                                   relief="flat", bd=0, wrap="none",
-                                   highlightthickness=0, padx=12, pady=8)
+        self.stats_text = tk.Text(
+            stats_frame,
+            bg=C["bg"],
+            fg=C["text"],
+            font=FONT_MONO_SM,
+            state="disabled",
+            relief="flat",
+            bd=0,
+            wrap="none",
+            highlightthickness=0,
+            padx=12,
+            pady=8,
+        )
         self.stats_text.pack(fill="both", expand=True)
 
         for tag, fg_c in [
-            ("header", C["accent"]), ("key", C["text2"]),
-            ("val", C["white"]), ("bar_fill", C["green"]),
-            ("bar_empty", C["text3"]), ("sep", C["border2"]),
-            ("warn", C["yellow"]), ("danger", C["red"]),
+            ("header", C["accent"]),
+            ("key", C["text2"]),
+            ("val", C["white"]),
+            ("bar_fill", C["green"]),
+            ("bar_empty", C["text3"]),
+            ("sep", C["border2"]),
+            ("warn", C["yellow"]),
+            ("danger", C["red"]),
         ]:
             self.stats_text.tag_configure(tag, foreground=fg_c)
 
@@ -742,30 +1001,46 @@ class NexScanApp(tk.Tk):
         bar.pack(fill="x", side="bottom")
         bar.pack_propagate(False)
 
-        self.lbl_statusbar = tk.Label(bar, text="Ready — Load a target and click Start Scan",
-                                       bg=C["header_bg"], fg=C["text3"],
-                                       font=FONT_MONO_SM, anchor="w")
+        self.lbl_statusbar = tk.Label(
+            bar,
+            text="Ready — Load a target and click Start Scan",
+            bg=C["header_bg"],
+            fg=C["text3"],
+            font=FONT_MONO_SM,
+            anchor="w",
+        )
         self.lbl_statusbar.pack(side="left", padx=12)
 
         # Right side: hostname display
-        self.lbl_hostname = tk.Label(bar, text="", bg=C["header_bg"],
-                                     fg=C["text3"], font=FONT_MONO_SM)
+        self.lbl_hostname = tk.Label(
+            bar, text="", bg=C["header_bg"], fg=C["text3"], font=FONT_MONO_SM
+        )
         self.lbl_hostname.pack(side="right", padx=12)
 
-        tk.Label(bar, text=f"◈ NexScan v{self.VERSION}",
-                 bg=C["header_bg"], fg=C["text3"],
-                 font=FONT_MONO_SM).pack(side="right", padx=12)
+        tk.Label(
+            bar,
+            text=f"◈ NexScan v{self.VERSION}",
+            bg=C["header_bg"],
+            fg=C["text3"],
+            font=FONT_MONO_SM,
+        ).pack(side="right", padx=12)
 
     # ─────────────────────────── HELPERS ───────────────────────────
 
-    def _make_button(self, parent, text, command, fg=None, bg=None,
-                     hover_bg=None, pad=(12, 6)):
+    def _make_button(self, parent, text, command, fg=None, bg=None, hover_bg=None, pad=(12, 6)):
         fg = fg or C["text"]
         bg = bg or C["btn_bg"]
         hover_bg = hover_bg or C["btn_hover"]
-        btn = tk.Label(parent, text=text, font=FONT_MONO_SM,
-                       bg=bg, fg=fg, cursor="hand2",
-                       padx=pad[0], pady=pad[1])
+        btn = tk.Label(
+            parent,
+            text=text,
+            font=FONT_MONO_SM,
+            bg=bg,
+            fg=fg,
+            cursor="hand2",
+            padx=pad[0],
+            pady=pad[1],
+        )
         btn.bind("<Button-1>", lambda e: command())
         btn.bind("<Enter>", lambda e: btn.configure(bg=hover_bg))
         btn.bind("<Leave>", lambda e: btn.configure(bg=bg))
@@ -778,13 +1053,20 @@ class NexScanApp(tk.Tk):
         # Section header
         hdr = tk.Frame(outer, bg=C["surface"])
         hdr.pack(fill="x")
-        tk.Label(hdr, text=f"  {title}", bg=C["accent_dim"], fg=C["accent"],
-                 font=FONT_MONO_SM, anchor="w", pady=3).pack(fill="x")
+        tk.Label(
+            hdr,
+            text=f"  {title}",
+            bg=C["accent_dim"],
+            fg=C["accent"],
+            font=FONT_MONO_SM,
+            anchor="w",
+            pady=3,
+        ).pack(fill="x")
 
         # Content area
-        content = tk.Frame(outer, bg=C["surface2"],
-                           highlightthickness=1,
-                           highlightbackground=C["border"])
+        content = tk.Frame(
+            outer, bg=C["surface2"], highlightthickness=1, highlightbackground=C["border"]
+        )
         content.pack(fill="x", pady=1)
         return content
 
@@ -797,6 +1079,7 @@ class NexScanApp(tk.Tk):
             if self.var_autoscroll.get():
                 self.txt_log.see("end")
             self.txt_log.configure(state="disabled")
+
         self.after(0, _insert)
 
     def _set_status(self, text: str, color: str = None):
@@ -870,7 +1153,7 @@ class NexScanApp(tk.Tk):
                 "Large Scan",
                 f"This scan covers {total:,} port/host combinations.\n"
                 "This may take a long time. Continue?",
-                icon="warning"
+                icon="warning",
             )
             if not ok:
                 return
@@ -882,10 +1165,16 @@ class NexScanApp(tk.Tk):
 
         self.stat_total_ports.set(total)
         self._set_status("SCANNING", C["green"])
-        self._log(f"Starting {config.scan_type.value} scan on {len(config.targets)} "
-                  f"target(s), {len(config.ports)} port(s) each", "info")
-        self._log(f"Threads: {config.threads}  Timeout: {config.timeout}s  "
-                  f"Banner: {config.grab_banners}  OS-detect: {config.detect_os}", "info")
+        self._log(
+            f"Starting {config.scan_type.value} scan on {len(config.targets)} "
+            f"target(s), {len(config.ports)} port(s) each",
+            "info",
+        )
+        self._log(
+            f"Threads: {config.threads}  Timeout: {config.timeout}s  "
+            f"Banner: {config.grab_banners}  OS-detect: {config.detect_os}",
+            "info",
+        )
 
         self.scanner = PortScanner(
             config,
@@ -930,7 +1219,9 @@ class NexScanApp(tk.Tk):
         """Called from scan thread when an open port is found."""
         self._ui_queue.put(("port_found", target, port_result))
 
-    def _on_progress(self, completed: int, total: int, target: str, host_done: int, host_total: int):
+    def _on_progress(
+        self, completed: int, total: int, target: str, host_done: int, host_total: int
+    ):
         self._ui_queue.put(("progress", completed, total, target, host_done, host_total))
 
     def _on_host_complete(self, result: ScanResult):
@@ -967,7 +1258,10 @@ class NexScanApp(tk.Tk):
                 self._log(log_msg, "open" if pr.state == PortState.OPEN else "filtered")
 
             if pr.ssl_info and pr.ssl_info.get("version"):
-                self._log(f"  ↳ SSL: {pr.ssl_info['version']}  CN={pr.ssl_info.get('common_name', '')}", "ssl")
+                self._log(
+                    f"  ↳ SSL: {pr.ssl_info['version']}  CN={pr.ssl_info.get('common_name', '')}",
+                    "ssl",
+                )
 
         elif kind == "progress":
             _, done, total, target, hdone, htotal = msg
@@ -981,11 +1275,16 @@ class NexScanApp(tk.Tk):
             _, result = msg
             self.stat_hosts_up.set(self.stat_hosts_up.get() + (1 if result.host_up else 0))
             status = "UP" if result.host_up else "DOWN"
-            self._log(f"Host {result.target} ({result.ip_address}) — {status}  "
-                      f"Open:{result.open_count} Filtered:{result.filtered_count}  "
-                      f"Duration:{result.scan_duration:.2f}s", "host")
+            self._log(
+                f"Host {result.target} ({result.ip_address}) — {status}  "
+                f"Open:{result.open_count} Filtered:{result.filtered_count}  "
+                f"Duration:{result.scan_duration:.2f}s",
+                "host",
+            )
             if result.os_guess:
-                self._log(f"  ↳ OS Guess: {result.os_guess} ({result.os_confidence}% confidence)", "info")
+                self._log(
+                    f"  ↳ OS Guess: {result.os_guess} ({result.os_confidence}% confidence)", "info"
+                )
             self._update_host_list()
             self._update_stats_tab()
 
@@ -994,10 +1293,13 @@ class NexScanApp(tk.Tk):
             self.is_scanning = False
             self._set_status("COMPLETE", C["accent"])
             elapsed = time.time() - self.scan_start_time
-            self._log(f"Scan complete in {elapsed:.1f}s  "
-                      f"Open:{self.stat_open.get()}  "
-                      f"Filtered:{self.stat_filtered.get()}  "
-                      f"Hosts up:{self.stat_hosts_up.get()}", "info")
+            self._log(
+                f"Scan complete in {elapsed:.1f}s  "
+                f"Open:{self.stat_open.get()}  "
+                f"Filtered:{self.stat_filtered.get()}  "
+                f"Hosts up:{self.stat_hosts_up.get()}",
+                "info",
+            )
             self.progress["value"] = 100
             self.lbl_progress.configure(text="100%")
             self._update_stats_tab()
@@ -1034,11 +1336,21 @@ class NexScanApp(tk.Tk):
         if ftext and ftext not in row_str:
             return
 
-        iid = self.tree.insert("", "end",
-            values=(target, pr.port, pr.protocol.upper(),
-                    pr.state.value, pr.service, pr.version,
-                    rtt, banner_short),
-            tags=(tag,))
+        iid = self.tree.insert(
+            "",
+            "end",
+            values=(
+                target,
+                pr.port,
+                pr.protocol.upper(),
+                pr.state.value,
+                pr.service,
+                pr.version,
+                rtt,
+                banner_short,
+            ),
+            tags=(tag,),
+        )
 
         # Alternating row
         count = len(self.tree.get_children())
@@ -1051,8 +1363,7 @@ class NexScanApp(tk.Tk):
         if not self.is_paused:
             elapsed = int(time.time() - self.scan_start_time)
             h, m, s = elapsed // 3600, (elapsed % 3600) // 60, elapsed % 60
-            self.lbl_timer.configure(text=f"{h:02d}:{m:02d}:{s:02d}",
-                                     fg=C["accent"])
+            self.lbl_timer.configure(text=f"{h:02d}:{m:02d}:{s:02d}", fg=C["accent"])
             self.lbl_timer_icon.configure(fg=C["accent"])
         self.after(1000, self._update_timer)
 
@@ -1087,24 +1398,31 @@ class NexScanApp(tk.Tk):
         w(f"◈ HOST REPORT\n", "header")
         w(sep, "sep")
 
-        w(f"  Target       : ", "key"); w(f"{result.target}\n", "value")
-        w(f"  IP Address   : ", "key"); w(f"{result.ip_address}\n", "value")
+        w(f"  Target       : ", "key")
+        w(f"{result.target}\n", "value")
+        w(f"  IP Address   : ", "key")
+        w(f"{result.ip_address}\n", "value")
         if result.hostname and result.hostname != result.target:
-            w(f"  Hostname     : ", "key"); w(f"{result.hostname}\n", "value")
+            w(f"  Hostname     : ", "key")
+            w(f"{result.hostname}\n", "value")
         w(f"  Status       : ", "key")
         if result.host_up:
             w("UP\n", "open")
         else:
             w("DOWN\n", "closed")
         if result.ttl:
-            w(f"  TTL          : ", "key"); w(f"{result.ttl}\n", "value")
+            w(f"  TTL          : ", "key")
+            w(f"{result.ttl}\n", "value")
         if result.os_guess:
             w(f"  OS Guess     : ", "key")
             w(f"{result.os_guess} ({result.os_confidence}% confidence)\n", "value")
 
-        w(f"  Scan Type    : ", "key"); w(f"{result.scan_type}\n", "value")
-        w(f"  Duration     : ", "key"); w(f"{result.scan_duration:.3f}s\n", "value")
-        w(f"  Timestamp    : ", "key"); w(f"{result.timestamp}\n", "value")
+        w(f"  Scan Type    : ", "key")
+        w(f"{result.scan_type}\n", "value")
+        w(f"  Duration     : ", "key")
+        w(f"{result.scan_duration:.3f}s\n", "value")
+        w(f"  Timestamp    : ", "key")
+        w(f"{result.timestamp}\n", "value")
         w(f"  Open / Filt / Closed : ", "key")
         w(f"{result.open_count}", "open")
         w(f" / ", "key")
@@ -1113,7 +1431,9 @@ class NexScanApp(tk.Tk):
         w(f"{result.closed_count}\n", "closed")
 
         open_ports = [p for p in result.ports if p.state == PortState.OPEN]
-        filt_ports = [p for p in result.ports if p.state in (PortState.FILTERED, PortState.OPEN_FILTERED)]
+        filt_ports = [
+            p for p in result.ports if p.state in (PortState.FILTERED, PortState.OPEN_FILTERED)
+        ]
 
         w("\n")
         w(sep, "sep")
@@ -1133,7 +1453,10 @@ class NexScanApp(tk.Tk):
                         w(f"          ↳ {line[:65]}\n", "banner_text")
                 if p.ssl_info:
                     ssl = p.ssl_info
-                    w(f"          ↳ SSL: {ssl.get('version','')}  Cipher: {ssl.get('cipher','')} ({ssl.get('cipher_bits',0)} bits)\n", "ssl_text")
+                    w(
+                        f"          ↳ SSL: {ssl.get('version','')}  Cipher: {ssl.get('cipher','')} ({ssl.get('cipher_bits',0)} bits)\n",
+                        "ssl_text",
+                    )
                     if ssl.get("common_name"):
                         w(f"          ↳ CN: {ssl['common_name']}", "ssl_text")
                     if ssl.get("not_after"):
@@ -1186,18 +1509,25 @@ class NexScanApp(tk.Tk):
         total_scanned = sum(len(r.ports) for r in self.scan_results)
         hosts_up = sum(1 for r in self.scan_results if r.host_up)
 
-        w(f"  Hosts Scanned     : ", "key"); w(f"{len(self.scan_results)}\n", "val")
-        w(f"  Hosts Up          : ", "key"); w(f"{hosts_up}\n", "val")
-        w(f"  Total Ports Tested: ", "key"); w(f"{total_scanned:,}\n", "val")
-        w(f"  Open Ports Found  : ", "key"); w(f"{len(all_open)}\n", "val")
-        w(f"  Filtered Ports    : ", "key"); w(f"{self.stat_filtered.get()}\n", "val")
+        w(f"  Hosts Scanned     : ", "key")
+        w(f"{len(self.scan_results)}\n", "val")
+        w(f"  Hosts Up          : ", "key")
+        w(f"{hosts_up}\n", "val")
+        w(f"  Total Ports Tested: ", "key")
+        w(f"{total_scanned:,}\n", "val")
+        w(f"  Open Ports Found  : ", "key")
+        w(f"{len(all_open)}\n", "val")
+        w(f"  Filtered Ports    : ", "key")
+        w(f"{self.stat_filtered.get()}\n", "val")
 
         if self.scan_results:
             total_dur = sum(r.scan_duration for r in self.scan_results)
-            w(f"  Total Scan Time   : ", "key"); w(f"{total_dur:.2f}s\n", "val")
+            w(f"  Total Scan Time   : ", "key")
+            w(f"{total_dur:.2f}s\n", "val")
             if total_scanned > 0:
                 rate = total_scanned / max(total_dur, 0.01)
-                w(f"  Avg Port Rate     : ", "key"); w(f"{rate:.0f} ports/sec\n", "val")
+                w(f"  Avg Port Rate     : ", "key")
+                w(f"{rate:.0f} ports/sec\n", "val")
 
         if service_counts:
             w("\n")
@@ -1294,11 +1624,21 @@ class NexScanApp(tk.Tk):
         for i, (target, p, tag, banner_short) in enumerate(all_rows):
             rtt = f"{p.response_time * 1000:.1f}"
             tags = (tag, "alt") if i % 2 == 0 else (tag,)
-            self.tree.insert("", "end",
-                values=(target, p.port, p.protocol.upper(),
-                        p.state.value, p.service, p.version,
-                        rtt, banner_short),
-                tags=tags)
+            self.tree.insert(
+                "",
+                "end",
+                values=(
+                    target,
+                    p.port,
+                    p.protocol.upper(),
+                    p.state.value,
+                    p.service,
+                    p.version,
+                    rtt,
+                    banner_short,
+                ),
+                tags=tags,
+            )
 
         self.lbl_result_count.configure(text=f"{len(all_rows)} results")
 
@@ -1314,9 +1654,17 @@ class NexScanApp(tk.Tk):
     # ─────────────────────────── EXPORT ───────────────────────────
 
     def _export_menu(self):
-        menu = tk.Menu(self, tearoff=0, bg=C["surface2"], fg=C["text"],
-                       activebackground=C["select"], activeforeground=C["white"],
-                       font=FONT_MONO_SM, bd=0, relief="solid")
+        menu = tk.Menu(
+            self,
+            tearoff=0,
+            bg=C["surface2"],
+            fg=C["text"],
+            activebackground=C["select"],
+            activeforeground=C["white"],
+            font=FONT_MONO_SM,
+            bd=0,
+            relief="solid",
+        )
         for label, fmt in [
             ("Export as JSON", "json"),
             ("Export as CSV", "csv"),
@@ -1338,8 +1686,7 @@ class NexScanApp(tk.Tk):
             messagebox.showwarning("No Data", "No scan results to export.")
             return
 
-        ext_map = {"json": ".json", "csv": ".csv", "html": ".html",
-                   "xml": ".xml", "txt": ".txt"}
+        ext_map = {"json": ".json", "csv": ".csv", "html": ".html", "xml": ".xml", "txt": ".txt"}
         ft_map = {
             "json": [("JSON files", "*.json")],
             "csv": [("CSV files", "*.csv")],
@@ -1351,9 +1698,7 @@ class NexScanApp(tk.Tk):
         ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         default = f"nexscan_{ts}{ext_map[fmt]}"
         path = filedialog.asksaveasfilename(
-            defaultextension=ext_map[fmt],
-            filetypes=ft_map[fmt],
-            initialfile=default
+            defaultextension=ext_map[fmt], filetypes=ft_map[fmt], initialfile=default
         )
         if not path:
             return
@@ -1398,8 +1743,7 @@ class NexScanApp(tk.Tk):
         try:
             ports = parse_ports(port_text)
             self.lbl_port_count.configure(
-                text=f"Ports to scan: {len(ports):,}",
-                fg=C["green"] if ports else C["red"]
+                text=f"Ports to scan: {len(ports):,}", fg=C["green"] if ports else C["red"]
             )
         except Exception:
             self.lbl_port_count.configure(text="Invalid port range", fg=C["red"])
@@ -1465,24 +1809,33 @@ class NexScanApp(tk.Tk):
         self.tree.selection_set(iid)
         values = self.tree.item(iid, "values")
 
-        menu = tk.Menu(self, tearoff=0, bg=C["surface2"], fg=C["text"],
-                       activebackground=C["select"], activeforeground=C["white"],
-                       font=FONT_MONO_SM, bd=0)
+        menu = tk.Menu(
+            self,
+            tearoff=0,
+            bg=C["surface2"],
+            fg=C["text"],
+            activebackground=C["select"],
+            activeforeground=C["white"],
+            font=FONT_MONO_SM,
+            bd=0,
+        )
 
         host, port = values[0], values[1]
-        menu.add_command(label=f"Copy {host}:{port}",
-                         command=lambda: self._copy_text(f"{host}:{port}"))
-        menu.add_command(label=f"Copy IP {host}",
-                         command=lambda: self._copy_text(host))
+        menu.add_command(
+            label=f"Copy {host}:{port}", command=lambda: self._copy_text(f"{host}:{port}")
+        )
+        menu.add_command(label=f"Copy IP {host}", command=lambda: self._copy_text(host))
         menu.add_separator()
-        menu.add_command(label="Show Port Detail",
-                         command=lambda: self._show_port_detail_by_values(values))
-        menu.add_command(label=f"Filter by port {port}",
-                         command=lambda: self.var_filter_text.set(str(port)))
-        menu.add_command(label=f"Filter by host {host}",
-                         command=lambda: self.var_filter_text.set(host))
-        menu.add_command(label="Clear filter",
-                         command=lambda: self.var_filter_text.set(""))
+        menu.add_command(
+            label="Show Port Detail", command=lambda: self._show_port_detail_by_values(values)
+        )
+        menu.add_command(
+            label=f"Filter by port {port}", command=lambda: self.var_filter_text.set(str(port))
+        )
+        menu.add_command(
+            label=f"Filter by host {host}", command=lambda: self.var_filter_text.set(host)
+        )
+        menu.add_command(label="Clear filter", command=lambda: self.var_filter_text.set(""))
 
         try:
             menu.tk_popup(event.x_root, event.y_root)
@@ -1522,33 +1875,54 @@ class NexScanApp(tk.Tk):
         popup.geometry("620x500")
         popup.resizable(True, True)
 
-        txt = tk.Text(popup, bg=C["bg"], fg=C["text"], font=FONT_MONO_SM,
-                      state="normal", relief="flat", padx=16, pady=12, wrap="word")
+        txt = tk.Text(
+            popup,
+            bg=C["bg"],
+            fg=C["text"],
+            font=FONT_MONO_SM,
+            state="normal",
+            relief="flat",
+            padx=16,
+            pady=12,
+            wrap="word",
+        )
         vsb = ttk.Scrollbar(popup, orient="vertical", command=txt.yview)
         txt.configure(yscrollcommand=vsb.set)
         vsb.pack(side="right", fill="y")
         txt.pack(fill="both", expand=True)
 
         for tag, fg_c in [
-            ("key", C["text2"]), ("val", C["text"]),
-            ("open", C["green"]), ("head", C["accent"]),
-            ("banner", C["orange"]), ("ssl", C["accent2"]),
+            ("key", C["text2"]),
+            ("val", C["text"]),
+            ("open", C["green"]),
+            ("head", C["accent"]),
+            ("banner", C["orange"]),
+            ("ssl", C["accent2"]),
         ]:
             txt.tag_configure(tag, foreground=fg_c)
         txt.tag_configure("bold", font=("Consolas", 10, "bold"))
 
-        def w(t, tag=None): txt.insert("end", t, tag)
+        def w(t, tag=None):
+            txt.insert("end", t, tag)
 
         w(f"PORT DETAIL\n", "head")
         w("─" * 50 + "\n", "key")
-        w(f"Host       : ", "key"); w(f"{result.target}\n", "val")
-        w(f"IP         : ", "key"); w(f"{result.ip_address}\n", "val")
-        w(f"Port       : ", "key"); w(f"{pr.port}/{pr.protocol.upper()}\n", "open")
-        w(f"State      : ", "key"); w(f"{pr.state.value}\n", "open")
-        w(f"Service    : ", "key"); w(f"{pr.service}\n", "val")
-        w(f"Version    : ", "key"); w(f"{pr.version}\n", "val")
-        w(f"CPE        : ", "key"); w(f"{pr.cpe}\n", "val")
-        w(f"RTT        : ", "key"); w(f"{pr.response_time*1000:.2f}ms\n", "val")
+        w(f"Host       : ", "key")
+        w(f"{result.target}\n", "val")
+        w(f"IP         : ", "key")
+        w(f"{result.ip_address}\n", "val")
+        w(f"Port       : ", "key")
+        w(f"{pr.port}/{pr.protocol.upper()}\n", "open")
+        w(f"State      : ", "key")
+        w(f"{pr.state.value}\n", "open")
+        w(f"Service    : ", "key")
+        w(f"{pr.service}\n", "val")
+        w(f"Version    : ", "key")
+        w(f"{pr.version}\n", "val")
+        w(f"CPE        : ", "key")
+        w(f"{pr.cpe}\n", "val")
+        w(f"RTT        : ", "key")
+        w(f"{pr.response_time*1000:.2f}ms\n", "val")
         w("\n")
 
         if pr.banner:
@@ -1564,14 +1938,15 @@ class NexScanApp(tk.Tk):
             for k, v in ssl.items():
                 if isinstance(v, list):
                     v = ", ".join(v[:5])
-                w(f"{k:<20}: ", "key"); w(f"{v}\n", "ssl")
+                w(f"{k:<20}: ", "key")
+                w(f"{v}\n", "ssl")
 
         txt.configure(state="disabled")
 
         # Close button
-        self._make_button(popup, "  Close  ", popup.destroy,
-                          fg=C["text"], bg=C["btn_bg"],
-                          hover_bg=C["btn_hover"]).pack(pady=8)
+        self._make_button(
+            popup, "  Close  ", popup.destroy, fg=C["text"], bg=C["btn_bg"], hover_bg=C["btn_hover"]
+        ).pack(pady=8)
 
     def _show_about(self):
         popup = tk.Toplevel(self)
@@ -1580,8 +1955,17 @@ class NexScanApp(tk.Tk):
         popup.geometry("480x360")
         popup.resizable(False, False)
 
-        txt = tk.Text(popup, bg=C["bg"], fg=C["text"], font=FONT_MONO_SM,
-                      state="normal", relief="flat", padx=24, pady=20, wrap="word")
+        txt = tk.Text(
+            popup,
+            bg=C["bg"],
+            fg=C["text"],
+            font=FONT_MONO_SM,
+            state="normal",
+            relief="flat",
+            padx=24,
+            pady=20,
+            wrap="word",
+        )
         txt.pack(fill="both", expand=True)
 
         for tag, fg_c, fnt in [
@@ -1613,15 +1997,18 @@ class NexScanApp(tk.Tk):
             txt.insert("end", f"  ✓ {f}\n", "key")
 
         txt.insert("end", "\n⚠ LEGAL NOTICE\n", "h2")
-        txt.insert("end",
+        txt.insert(
+            "end",
             "  Only scan systems you own or have explicit permission\n"
-            "  to scan. Unauthorized port scanning may be illegal.\n", "key")
+            "  to scan. Unauthorized port scanning may be illegal.\n",
+            "key",
+        )
 
         txt.configure(state="disabled")
 
-        self._make_button(popup, "  Close  ", popup.destroy,
-                          fg=C["text"], bg=C["btn_bg"],
-                          hover_bg=C["btn_hover"]).pack(pady=10)
+        self._make_button(
+            popup, "  Close  ", popup.destroy, fg=C["text"], bg=C["btn_bg"], hover_bg=C["btn_hover"]
+        ).pack(pady=10)
 
     def _setup_bindings(self):
         self.bind("<F5>", lambda e: self._start_scan())
@@ -1633,9 +2020,7 @@ class NexScanApp(tk.Tk):
     def _on_close(self):
         if self.is_scanning:
             ok = messagebox.askyesno(
-                "Scan Running",
-                "A scan is currently running. Stop it and exit?",
-                icon="warning"
+                "Scan Running", "A scan is currently running. Stop it and exit?", icon="warning"
             )
             if not ok:
                 return
