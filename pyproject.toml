@@ -78,6 +78,7 @@ ignore = [
 [tool.black]
 line-length = 100
 target-version = ["py310", "py311", "py312"]
+exclude = "tests/test_nexscan\\.py"
 
 # ── Mypy ──────────────────────────────────────────────────────────────
 [tool.mypy]
