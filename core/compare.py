@@ -1,8 +1,9 @@
 """Scan comparison and diff utility."""
 
 from dataclasses import dataclass
-from typing import List, Tuple
-from core.scanner import ScanResult, PortState
+from typing import List
+
+from core.scanner import PortState, ScanResult
 
 
 @dataclass

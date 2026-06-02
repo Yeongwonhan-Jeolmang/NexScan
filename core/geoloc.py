@@ -1,9 +1,10 @@
 """WHOIS and geolocation lookup utility."""
 
-import urllib.request
 import json
+import urllib.request
 from dataclasses import dataclass
 from typing import Optional
+
 from utils.logger import get_logger
 
 logger = get_logger(__name__)

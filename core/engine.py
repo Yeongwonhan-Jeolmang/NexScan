@@ -1,9 +1,7 @@
 """High-level engine helpers and async wrappers for NexScan."""
 
 import asyncio
-import json
 import os
-import platform
 from typing import Callable, Optional
 
 from core.exceptions import InvalidPortSpec, InvalidTargetSpec, PrivilegeError

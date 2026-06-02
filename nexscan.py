@@ -18,6 +18,7 @@ Keyboard shortcuts:
 import argparse
 import os
 import sys
+
 from utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -44,15 +45,12 @@ def launch_gui():
 
 def run_cli(args):
     """CLI scan mode with support for new features."""
+    from core import engine
     from core.scanner import (
-        PortScanner,
+        PortState,
         ScanConfig,
         ScanType,
-        PortState,
-        parse_ports,
-        parse_targets,
     )
-    from core import engine
 
     # Load targets from file or CLI arg
     targets_str = args.targets
@@ -124,7 +122,7 @@ def run_cli(args):
 
         # Geolocation lookup
         if args.geoloc:
-            from core.geoloc import lookup_geolocation, format_geolocation_report
+            from core.geoloc import format_geolocation_report, lookup_geolocation
 
             geo = lookup_geolocation(result.ip_address)
             if geo:
@@ -132,7 +130,7 @@ def run_cli(args):
 
         # CVE lookup for open ports
         if args.cve_lookup:
-            from core.cve_lookup import lookup_service_cves, format_cve_report
+            from core.cve_lookup import format_cve_report, lookup_service_cves
 
             for port in result.ports:
                 if port.state == PortState.OPEN and port.service:
@@ -152,7 +150,7 @@ def run_cli(args):
     logger.info(f"Hosts up: {hosts_up}/{len(results)}  Open ports: {total_open}")
 
     if args.output:
-        from reports.exporter import export_json, export_csv, export_html, export_txt, export_xml
+        from reports.exporter import export_csv, export_html, export_json, export_txt, export_xml
 
         fmt = os.path.splitext(args.output)[1].lstrip(".")
         fn_map = {
@@ -183,7 +181,7 @@ def run_cli(args):
 
 def _handle_timeline_query(args):
     """Handle scan history timeline queries."""
-    from core.db import fetch_all_runs, get_timeline_summary, fetch_run_by_id, fetch_runs_by_target
+    from core.db import get_timeline_summary
 
     db_path = args.db_path
 
@@ -206,9 +204,8 @@ def _handle_timeline_query(args):
 
 def _handle_scan_comparison(args):
     """Handle scan comparison."""
-    from core.db import fetch_run_by_id
     from core.compare import compare_scans, generate_diff_report
-    from core.scanner import ScanResult
+    from core.db import fetch_run_by_id
 
     db_path = args.db_path
 

@@ -3,9 +3,7 @@ NexScan GUI — Main Application Window
 Dark terminal-inspired professional port scanner interface.
 """
 
-from collections import defaultdict
 import datetime
-import ipaddress
 import json
 import os
 import queue
@@ -14,6 +12,7 @@ import sys
 import threading
 import time
 import tkinter as tk
+from collections import defaultdict
 from tkinter import filedialog, messagebox, ttk
 
 from core.scanner import (
@@ -26,7 +25,7 @@ from core.scanner import (
     parse_ports,
     parse_targets,
 )
-from core.service_db import COMMON_PORTS, ServiceDatabase
+from core.service_db import ServiceDatabase
 from reports.exporter import (
     export_csv,
     export_html,
@@ -1115,7 +1114,7 @@ class NexScanApp(tk.Tk):
             messagebox.showwarning("No Data", "Run a scan first to lookup CVEs")
             return
 
-        from core.cve_lookup import lookup_service_cves, format_cve_report
+        from core.cve_lookup import format_cve_report, lookup_service_cves
         from core.scanner import PortState
 
         self.vuln_text.configure(state="normal")
@@ -1165,7 +1164,7 @@ class NexScanApp(tk.Tk):
             messagebox.showwarning("No Data", "Run a scan first to lookup geolocation")
             return
 
-        from core.geoloc import lookup_geolocation, format_geolocation_report
+        from core.geoloc import format_geolocation_report, lookup_geolocation
 
         self.vuln_text.configure(state="normal")
         self.vuln_text.delete("1.0", "end")
@@ -1602,39 +1601,39 @@ class NexScanApp(tk.Tk):
             dt.insert("end", text, tag)
 
         sep = "─" * 68 + "\n"
-        w(f"◈ HOST REPORT\n", "header")
+        w("◈ HOST REPORT\n", "header")
         w(sep, "sep")
 
-        w(f"  Target       : ", "key")
+        w("  Target       : ", "key")
         w(f"{result.target}\n", "value")
-        w(f"  IP Address   : ", "key")
+        w("  IP Address   : ", "key")
         w(f"{result.ip_address}\n", "value")
         if result.hostname and result.hostname != result.target:
-            w(f"  Hostname     : ", "key")
+            w("  Hostname     : ", "key")
             w(f"{result.hostname}\n", "value")
-        w(f"  Status       : ", "key")
+        w("  Status       : ", "key")
         if result.host_up:
             w("UP\n", "open")
         else:
             w("DOWN\n", "closed")
         if result.ttl:
-            w(f"  TTL          : ", "key")
+            w("  TTL          : ", "key")
             w(f"{result.ttl}\n", "value")
         if result.os_guess:
-            w(f"  OS Guess     : ", "key")
+            w("  OS Guess     : ", "key")
             w(f"{result.os_guess} ({result.os_confidence}% confidence)\n", "value")
 
-        w(f"  Scan Type    : ", "key")
+        w("  Scan Type    : ", "key")
         w(f"{result.scan_type}\n", "value")
-        w(f"  Duration     : ", "key")
+        w("  Duration     : ", "key")
         w(f"{result.scan_duration:.3f}s\n", "value")
-        w(f"  Timestamp    : ", "key")
+        w("  Timestamp    : ", "key")
         w(f"{result.timestamp}\n", "value")
-        w(f"  Open / Filt / Closed : ", "key")
+        w("  Open / Filt / Closed : ", "key")
         w(f"{result.open_count}", "open")
-        w(f" / ", "key")
+        w(" / ", "key")
         w(f"{result.filtered_count}", "filtered")
-        w(f" / ", "key")
+        w(" / ", "key")
         w(f"{result.closed_count}\n", "closed")
 
         open_ports = [p for p in result.ports if p.state == PortState.OPEN]
@@ -1716,24 +1715,24 @@ class NexScanApp(tk.Tk):
         total_scanned = sum(len(r.ports) for r in self.scan_results)
         hosts_up = sum(1 for r in self.scan_results if r.host_up)
 
-        w(f"  Hosts Scanned     : ", "key")
+        w("  Hosts Scanned     : ", "key")
         w(f"{len(self.scan_results)}\n", "val")
-        w(f"  Hosts Up          : ", "key")
+        w("  Hosts Up          : ", "key")
         w(f"{hosts_up}\n", "val")
-        w(f"  Total Ports Tested: ", "key")
+        w("  Total Ports Tested: ", "key")
         w(f"{total_scanned:,}\n", "val")
-        w(f"  Open Ports Found  : ", "key")
+        w("  Open Ports Found  : ", "key")
         w(f"{len(all_open)}\n", "val")
-        w(f"  Filtered Ports    : ", "key")
+        w("  Filtered Ports    : ", "key")
         w(f"{self.stat_filtered.get()}\n", "val")
 
         if self.scan_results:
             total_dur = sum(r.scan_duration for r in self.scan_results)
-            w(f"  Total Scan Time   : ", "key")
+            w("  Total Scan Time   : ", "key")
             w(f"{total_dur:.2f}s\n", "val")
             if total_scanned > 0:
                 rate = total_scanned / max(total_dur, 0.01)
-                w(f"  Avg Port Rate     : ", "key")
+                w("  Avg Port Rate     : ", "key")
                 w(f"{rate:.0f} ports/sec\n", "val")
 
         if service_counts:
@@ -2130,23 +2129,23 @@ class NexScanApp(tk.Tk):
         def w(t, tag=None):
             txt.insert("end", t, tag)
 
-        w(f"PORT DETAIL\n", "head")
+        w("PORT DETAIL\n", "head")
         w("─" * 50 + "\n", "key")
-        w(f"Host       : ", "key")
+        w("Host       : ", "key")
         w(f"{result.target}\n", "val")
-        w(f"IP         : ", "key")
+        w("IP         : ", "key")
         w(f"{result.ip_address}\n", "val")
-        w(f"Port       : ", "key")
+        w("Port       : ", "key")
         w(f"{pr.port}/{pr.protocol.upper()}\n", "open")
-        w(f"State      : ", "key")
+        w("State      : ", "key")
         w(f"{pr.state.value}\n", "open")
-        w(f"Service    : ", "key")
+        w("Service    : ", "key")
         w(f"{pr.service}\n", "val")
-        w(f"Version    : ", "key")
+        w("Version    : ", "key")
         w(f"{pr.version}\n", "val")
-        w(f"CPE        : ", "key")
+        w("CPE        : ", "key")
         w(f"{pr.cpe}\n", "val")
-        w(f"RTT        : ", "key")
+        w("RTT        : ", "key")
         w(f"{pr.response_time*1000:.2f}ms\n", "val")
         w("\n")
 
@@ -2201,7 +2200,7 @@ class NexScanApp(tk.Tk):
         ]:
             txt.tag_configure(tag, foreground=fg_c, font=fnt)
 
-        txt.insert("end", f"◈ NEXSCAN\n", "h1")
+        txt.insert("end", "◈ NEXSCAN\n", "h1")
         txt.insert("end", f"v{self.VERSION} — Advanced Port Scanner\n\n", "val")
         txt.insert("end", "KEYBOARD SHORTCUTS\n", "h2")
         txt.insert("end", "F5              Start scan\n", "key")
@@ -2257,7 +2256,6 @@ class NexScanApp(tk.Tk):
 
     def _save_profile(self):
         """Save current scan configuration as a profile."""
-        import json
 
         file = filedialog.asksaveasfilename(
             defaultextension=".json",
@@ -2290,7 +2288,6 @@ class NexScanApp(tk.Tk):
 
     def _load_profile(self):
         """Load a saved scan configuration profile."""
-        import json
 
         file = filedialog.askopenfilename(
             filetypes=[("NexScan Profile", "*.json"), ("All Files", "*.*")]

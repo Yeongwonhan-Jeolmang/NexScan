@@ -1,8 +1,8 @@
 """Simple SQLite persistence for scan runs."""
 
+import datetime
 import json
 import sqlite3
-import datetime
 from typing import Iterable, List, Tuple
 
 

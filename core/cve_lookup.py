@@ -2,8 +2,9 @@
 
 import json
 import urllib.request
-from typing import List, Optional
 from dataclasses import dataclass
+from typing import List
+
 from utils.logger import get_logger
 
 logger = get_logger(__name__)

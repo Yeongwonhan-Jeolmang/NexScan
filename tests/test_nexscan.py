@@ -3,17 +3,21 @@ NexScan — Basic test suite
 Run with: pytest tests/ -v
 """
 
+import os
+import tempfile
+
+from core import db as core_db
+from core import engine
 from core.scanner import (
     PortResult,
     PortState,
     ScanConfig,
+    ScanResult,
     ScanType,
     parse_ports,
     parse_targets,
 )
-from core.scanner import ScanResult
-from core.service_db import COMMON_PORTS, ServiceDatabase
-import pytest
+from core.service_db import ServiceDatabase
 from reports.exporter import (
     export_csv,
     export_html,
@@ -21,10 +25,6 @@ from reports.exporter import (
     export_txt,
     export_xml,
 )
-from core import engine
-from core import db as core_db
-import tempfile
-import os
 
 # ─────────────────────────── parse_ports ────────────────────────────
 
@@ -301,7 +301,7 @@ def test_engine_validators_and_db_roundtrip():
 
 def test_db_timeline_queries():
     """Test new timeline query functions."""
-    from core.db import get_timeline_summary, fetch_runs_by_target, fetch_runs_by_date_range
+    from core.db import fetch_runs_by_target, get_timeline_summary
 
     results = _make_results()
     fd, path = tempfile.mkstemp(prefix="nexscan_test_", suffix=".db")
@@ -332,7 +332,7 @@ def test_db_timeline_queries():
 
 def test_compare_scans_new_ports():
     """Test detection of new ports in comparison."""
-    from core.compare import compare_scans, PortDiff
+    from core.compare import compare_scans
 
     # Scan before: port 80 only
     before = _make_results()

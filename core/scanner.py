@@ -5,16 +5,15 @@ service fingerprinting, and OS detection.
 """
 
 import concurrent.futures
-from dataclasses import dataclass, field
-from enum import Enum
 import ipaddress
-import queue
 import select
 import socket
 import ssl
 import struct
 import threading
 import time
+from dataclasses import dataclass, field
+from enum import Enum
 from typing import Callable, Optional
 
 from core.service_db import ServiceDatabase
