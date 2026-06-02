@@ -332,13 +332,15 @@ def test_db_timeline_queries():
 
 def test_compare_scans_new_ports():
     """Test detection of new ports in comparison."""
+    import copy
+
     from core.compare import compare_scans
 
     # Scan before: port 80 only
     before = _make_results()
 
-    # Scan after: port 80 and 443 (port 443 is new)
-    after_result = before[0]
+    # Scan after: deep copy so before and after are independent objects
+    after_result = copy.deepcopy(before[0])
     new_port = PortResult(
         port=443,
         state=PortState.OPEN,
@@ -350,12 +352,8 @@ def test_compare_scans_new_ports():
     after_result.open_count = 2
     after = [after_result]
 
-    diffs = compare_scans(
-        [r.to_dict() for r in before], [r.to_dict() for r in after]
-    )  # both before and after should be lists of dicts
+    diffs = compare_scans([r.to_dict() for r in before], [r.to_dict() for r in after])
 
-    # The conversion to dict may lose port objects, so we verify the comparison function
-    # receives the right structure
     assert diffs is not None
     assert len(diffs) >= 1
 
