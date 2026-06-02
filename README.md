@@ -22,6 +22,13 @@
 - Port presets (Top 100, Top 1000, Web, Database, …) and custom ranges
 - Host discovery & reverse DNS lookup
 - Result filtering, sorting, and context menus
+- Scan comparison — Detect port changes between scan runs
+- CVE vulnerability lookup — Check discovered services against NVD database
+- Geolocation & WHOIS — Map IP addresses to geographical locations
+- Scan timeline — Query scan history by date, target, or service
+- Batch processing — Scan multiple targets from file (one per line)
+- ETA tracking — Real-time scan progress with estimated completion time
+- Profile management — Save/load scan configurations
 
 ---
 
@@ -34,7 +41,13 @@ nexscan/
 │   └── app.py          # Tkinter main window
 ├── core/
 │   ├── scanner.py      # Scanning engine, data classes
-│   └── service_db.py   # Port → service mapping & presets
+│   ├── service_db.py   # Port → service mapping & presets
+│   ├── engine.py       # High-level scanning API with validation
+│   ├── db.py           # SQLite persistence & timeline queries
+│   ├── compare.py      # Scan differential analysis
+│   ├── cve_lookup.py   # Vulnerability lookup (NVD API)
+│   ├── geoloc.py       # Geolocation & WHOIS lookup
+│   └── exceptions.py   # Custom exception hierarchy
 ├── reports/
 │   └── exporter.py     # JSON / CSV / HTML / XML / TXT exporters
 ├── utils/
@@ -106,8 +119,9 @@ nexscan
 ```bash
 python nexscan.py --cli -t 192.168.1.0/24 -p 22,80,443,1-1024
 
-# Options
+# Scanning options
   -t, --targets         IP, hostname, CIDR, or range  (required in CLI mode)
+  -f, --target-file     Read targets from file (one per line)
   -p, --ports           Port spec, e.g. 1-1024 or 22,80,443  (default: 1-1024)
   -s, --scan-type       tcp | udp | syn  (default: tcp)
       --threads         Concurrent threads  (default: 300)
@@ -116,6 +130,14 @@ python nexscan.py --cli -t 192.168.1.0/24 -p 22,80,443,1-1024
       --os-detect       Enable heuristic OS detection
       --skip-discovery  Skip host-up check
   -o, --output          Output file (.json / .csv / .html / .txt / .xml)
+      --save-db         Persist scan to SQLite history database
+
+# Advanced analysis options
+      --cve-lookup      Lookup CVEs for detected services (NVD API)
+      --geoloc          Perform geolocation/WHOIS lookup on discovered IPs
+      --compare ID      Compare against previous scan run by ID
+      --timeline        Display scan history timeline (list/search/date-range)
+      --db-path PATH    Path to scan history database (default: nexscan_history.db)
 ```
 
 #### Examples
@@ -129,7 +151,80 @@ python nexscan.py --cli -t 192.168.1.0/24 -p 80,443,8080 -o report.html
 
 # UDP scan with OS detection
 python nexscan.py --cli -t 10.0.0.1 -p 53,161,123 -s udp --os-detect
+
+# Scan with vulnerability & geolocation analysis
+python nexscan.py --cli -t 192.168.1.1 -p 22,80,443 --cve-lookup --geoloc --save-db
+
+# Batch scan from file with history persistence
+python nexscan.py --cli -f targets.txt -p 1-1000 --save-db
+
+# Compare current scan against previous run
+python nexscan.py --cli -t 192.168.1.1 -p 22,80,443 --compare 5 --db-path nexscan_history.db
+
+# View scan history timeline
+python nexscan.py --cli --timeline list --db-path nexscan_history.db
 ```
+
+---
+
+## Advanced Features
+
+### Scan Comparison
+Compare results between two scan runs to detect changes:
+```bash
+# First scan
+python nexscan.py --cli -t 192.168.1.1 -p 22,80,443 --save-db
+
+# ... time passes ...
+
+# Second scan with comparison
+python nexscan.py --cli -t 192.168.1.1 -p 22,80,443 --compare 1 --save-db
+```
+Output shows: new ports (✚), closed ports (✗), state changes (⟳), service updates (ⓘ)
+
+### CVE Vulnerability Lookup
+Automatically check discovered services against the NVD database:
+```bash
+python nexscan.py --cli -t 192.168.1.1 -p 22,80,443 --cve-lookup
+```
+- Severity indicators: 🔴 CRITICAL, 🟠 HIGH, 🟡 MEDIUM, 🟢 LOW
+- Queries official NVD API with offline fallback cache
+
+### Geolocation & WHOIS
+Map discovered IP addresses to their geographical location and ISP:
+```bash
+python nexscan.py --cli -t 192.168.1.0/24 --geoloc
+```
+- Displays: Country, city, coordinates, ISP, AS number
+- Uses free ipapi.co API (30K requests/month limit)
+
+### Scan Timeline & History
+Query scan history by date, target, or browse all scans:
+```bash
+# View recent scans
+python nexscan.py --cli --timeline list
+
+# Query by date range (ISO format)
+python nexscan.py --cli --timeline --db-path nexscan_history.db
+```
+All scans are persisted to SQLite with `--save-db` flag.
+
+### Batch Target Processing
+Read targets from a file for large-scale scans:
+```bash
+# targets.txt (one target per line)
+# 192.168.1.1
+# 10.0.0.0/24
+# example.com
+
+python nexscan.py --cli -f targets.txt -p 22,80,443 --save-db
+```
+
+### GUI Enhancements
+- **Vulnerabilities Tab**: Browse CVE findings and geolocation data with one click
+- **Profile Save/Load**: Use `Ctrl+S` to save scan configurations, `Ctrl+O` to load
+- **ETA Tracking**: Real-time estimated completion time (F5 to scan)
+- **Regex Filtering**: Advanced filtering with regex pattern support
 
 ---
 

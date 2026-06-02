@@ -240,6 +240,7 @@ class NexScanApp(tk.Tk):
         self.is_scanning = False
         self.is_paused = False
         self.scan_start_time = None
+        self.filtered_results = []
 
         # Live scan stats
         self.stat_open = tk.IntVar(value=0)
@@ -247,6 +248,7 @@ class NexScanApp(tk.Tk):
         self.stat_hosts_up = tk.IntVar(value=0)
         self.stat_ports_done = tk.IntVar(value=0)
         self.stat_total_ports = tk.IntVar(value=0)
+        self.stat_eta = tk.StringVar(value="—")
 
         # Settings vars
         self.var_scan_type = tk.StringVar(value="TCP Connect")
@@ -266,6 +268,7 @@ class NexScanApp(tk.Tk):
         self.var_sort_col = tk.StringVar(value="port")
         self.var_filter_text = tk.StringVar()
         self.var_filter_text.trace_add("write", self._apply_filter)
+        self.var_filter_regex = tk.BooleanVar(value=False)
 
     def _build_ui(self):
         # ── Top bar ──
@@ -636,13 +639,37 @@ class NexScanApp(tk.Tk):
             pad=(6, 2),
         ).pack(side="left", padx=4)
 
+        # Profile management
+        prow = tk.Frame(tab, bg=C["surface2"])
+        prow.pack(fill="x", padx=8, pady=6)
+
+        self._make_button(
+            prow,
+            "💾 Save Profile",
+            self._save_profile,
+            fg=C["accent"],
+            bg=C["btn_bg"],
+            hover_bg=C["btn_hover"],
+            pad=(8, 4),
+        ).pack(side="left", padx=2)
+
+        self._make_button(
+            prow,
+            "📂 Load Profile",
+            self._load_profile,
+            fg=C["accent"],
+            bg=C["btn_bg"],
+            hover_bg=C["btn_hover"],
+            pad=(8, 4),
+        ).pack(side="left", padx=2)
+
     def _build_right_panel(self, parent):
         frame = tk.Frame(parent, bg=C["bg"])
 
         # ── Stats bar ──
         self._build_stats_bar(frame)
 
-        # ── Progress bar ──
+        # ── Progress bar with ETA ──
         pbar_frame = tk.Frame(frame, bg=C["bg"])
         pbar_frame.pack(fill="x", padx=12, pady=(0, 6))
 
@@ -650,10 +677,25 @@ class NexScanApp(tk.Tk):
             pbar_frame, style="Scan.Horizontal.TProgressbar", mode="determinate", length=400
         )
         self.progress.pack(fill="x", side="left", expand=True)
+
+        eta_col = tk.Frame(pbar_frame, bg=C["bg"])
+        eta_col.pack(side="right", padx=4)
         self.lbl_progress = tk.Label(
-            pbar_frame, text="0%", bg=C["bg"], fg=C["text3"], font=FONT_MONO_SM, width=6
+            eta_col, text="0%", bg=C["bg"], fg=C["text3"], font=FONT_MONO_SM, width=4
         )
-        self.lbl_progress.pack(side="right", padx=4)
+        self.lbl_progress.pack(side="left", padx=2)
+        tk.Label(eta_col, text="ETA:", bg=C["bg"], fg=C["text3"], font=FONT_MONO_SM).pack(
+            side="left", padx=(8, 2)
+        )
+        self.lbl_eta = tk.Label(
+            eta_col,
+            textvariable=self.stat_eta,
+            bg=C["bg"],
+            fg=C["accent"],
+            font=FONT_MONO_SM,
+            width=10,
+        )
+        self.lbl_eta.pack(side="left")
 
         # ── Notebook: Results / Log / SSL / OS ──
         nb = ttk.Notebook(frame)
@@ -663,6 +705,7 @@ class NexScanApp(tk.Tk):
         self._build_log_tab(nb)
         self._build_detail_tab(nb)
         self._build_compare_tab(nb)
+        self._build_vuln_tab(nb)
 
         return frame
 
@@ -736,6 +779,10 @@ class NexScanApp(tk.Tk):
             width=30,
         )
         self.entry_filter.pack(side="left", padx=4, ipady=4)
+
+        ttk.Checkbutton(fbar, text="Regex", variable=self.var_filter_regex).pack(
+            side="left", padx=2
+        )
 
         # Sort controls
         tk.Label(fbar, text="Sort:", bg=C["surface"], fg=C["text2"], font=FONT_MONO_SM).pack(
@@ -996,6 +1043,149 @@ class NexScanApp(tk.Tk):
         ]:
             self.stats_text.tag_configure(tag, foreground=fg_c)
 
+    def _build_vuln_tab(self, notebook):
+        """Tab for CVE/vulnerability info and geolocation."""
+        tab = tk.Frame(notebook, bg=C["bg"])
+        notebook.add(tab, text="  Vulnerabilities  ")
+
+        ctrl = tk.Frame(tab, bg=C["surface"])
+        ctrl.pack(fill="x", padx=4, pady=(4, 2))
+
+        self._make_button(
+            ctrl,
+            "🔍 Lookup CVEs",
+            self._lookup_cves,
+            fg=C["red"],
+            bg=C["btn_bg"],
+            hover_bg=C["btn_hover"],
+            pad=(8, 3),
+        ).pack(side="left", padx=4)
+
+        self._make_button(
+            ctrl,
+            "📍 Lookup Geolocation",
+            self._lookup_geolocation,
+            fg=C["accent"],
+            bg=C["btn_bg"],
+            hover_bg=C["btn_hover"],
+            pad=(8, 3),
+        ).pack(side="left", padx=4)
+
+        # Vulnerability text area
+        vuln_frame = tk.Frame(tab, bg=C["bg"])
+        vuln_frame.pack(fill="both", expand=True, padx=4, pady=(0, 4))
+
+        self.vuln_text = tk.Text(
+            vuln_frame,
+            bg=C["bg"],
+            fg=C["text"],
+            font=FONT_MONO_SM,
+            state="disabled",
+            relief="flat",
+            bd=0,
+            wrap="word",
+            highlightthickness=1,
+            highlightbackground=C["border"],
+            padx=12,
+            pady=8,
+        )
+
+        vuln_vsb = ttk.Scrollbar(vuln_frame, orient="vertical", command=self.vuln_text.yview)
+        vuln_hsb = ttk.Scrollbar(vuln_frame, orient="horizontal", command=self.vuln_text.xview)
+        self.vuln_text.configure(yscrollcommand=vuln_vsb.set, xscrollcommand=vuln_hsb.set)
+
+        vuln_vsb.pack(side="right", fill="y")
+        vuln_hsb.pack(side="bottom", fill="x")
+        self.vuln_text.pack(fill="both", expand=True)
+
+        # Tags
+        for tag, fg_c in [
+            ("cve_critical", C["red"]),
+            ("cve_high", C["orange"]),
+            ("cve_medium", C["yellow"]),
+            ("cve_low", C["green"]),
+            ("header", C["accent"]),
+            ("geo_info", C["accent2"]),
+        ]:
+            self.vuln_text.tag_configure(tag, foreground=fg_c)
+
+    def _lookup_cves(self):
+        """Trigger CVE lookup for detected services."""
+        if not self.scan_results:
+            messagebox.showwarning("No Data", "Run a scan first to lookup CVEs")
+            return
+
+        from core.cve_lookup import lookup_service_cves, format_cve_report
+        from core.scanner import PortState
+
+        self.vuln_text.configure(state="normal")
+        self.vuln_text.delete("1.0", "end")
+
+        self.vuln_text.insert("end", "CVE VULNERABILITY LOOKUP\n", "header")
+        self.vuln_text.insert("end", "=" * 60 + "\n\n", "header")
+
+        cve_count = 0
+        for result in self.scan_results:
+            for port in result.ports:
+                if port.state == PortState.OPEN and port.service:
+                    cves = lookup_service_cves(port.service, port.version, limit=3)
+                    if cves:
+                        cve_count += len(cves)
+                        tag = (
+                            "cve_critical"
+                            if cves[0].severity == "CRITICAL"
+                            else (
+                                "cve_high"
+                                if cves[0].severity == "HIGH"
+                                else "cve_medium" if cves[0].severity == "MEDIUM" else "cve_low"
+                            )
+                        )
+                        self.vuln_text.insert(
+                            "end",
+                            f"\n{result.target}:{port.port}/{port.protocol} — {port.service} {port.version}\n",
+                            "header",
+                        )
+                        report = format_cve_report(port.service, port.version, cves)
+                        self.vuln_text.insert("end", report + "\n\n", tag)
+
+        if cve_count == 0:
+            self.vuln_text.insert(
+                "end", "  ✓ No known CVEs found for detected services\n", "cve_low"
+            )
+        else:
+            self.vuln_text.insert(
+                "end", f"\n{cve_count} CVE(s) found — check details above\n", "header"
+            )
+
+        self.vuln_text.configure(state="disabled")
+
+    def _lookup_geolocation(self):
+        """Lookup geolocation for discovered hosts."""
+        if not self.scan_results:
+            messagebox.showwarning("No Data", "Run a scan first to lookup geolocation")
+            return
+
+        from core.geoloc import lookup_geolocation, format_geolocation_report
+
+        self.vuln_text.configure(state="normal")
+        self.vuln_text.delete("1.0", "end")
+
+        self.vuln_text.insert("end", "GEOLOCATION LOOKUP\n", "header")
+        self.vuln_text.insert("end", "=" * 60 + "\n\n", "header")
+
+        for result in self.scan_results:
+            if result.host_up:
+                geo = lookup_geolocation(result.ip_address)
+                if geo:
+                    report = format_geolocation_report(geo)
+                    self.vuln_text.insert("end", report + "\n\n", "geo_info")
+                else:
+                    self.vuln_text.insert(
+                        "end", f"  {result.target} ({result.ip_address}) — No info\n\n", "header"
+                    )
+
+        self.vuln_text.configure(state="disabled")
+
     def _build_statusbar(self):
         bar = tk.Frame(self, bg=C["header_bg"], height=24)
         bar.pack(fill="x", side="bottom")
@@ -1210,7 +1400,13 @@ class NexScanApp(tk.Tk):
             self._log("Scan paused.", "info")
 
     def _stop_scan(self):
-        if self.scanner:
+        if not self.is_scanning:
+            return
+        # Ask for confirmation
+        ok = messagebox.askyesno(
+            "Cancel Scan", "Are you sure you want to cancel the scan?", icon="warning"
+        )
+        if ok and self.scanner:
             self.scanner.stop()
             self._set_status("STOPPING...", C["red"])
             self._log("Stop requested...", "error")
@@ -1270,6 +1466,17 @@ class NexScanApp(tk.Tk):
             self.lbl_progress.configure(text=f"{pct}%")
             self.stat_ports_done.set(done)
             self._set_current(f"{target} [{hdone}/{htotal}]")
+
+            # Calculate ETA
+            if done > 0 and total > 0 and self.is_scanning:
+                elapsed = time.time() - self.scan_start_time
+                rate = done / elapsed if elapsed > 0 else 1
+                remaining = (total - done) / rate if rate > 0 else 0
+                m, s = int(remaining) // 60, int(remaining) % 60
+                eta_str = f"{m}m {s}s" if m > 0 else f"{s}s"
+                self.stat_eta.set(eta_str)
+            else:
+                self.stat_eta.set("—")
 
         elif kind == "host_complete":
             _, result = msg
@@ -1578,13 +1785,25 @@ class NexScanApp(tk.Tk):
 
     def _refresh_results_view(self):
         """Rebuild the treeview from scan_results with current filters/sort."""
+        import re
+
         self.tree.delete(*self.tree.get_children())
 
         host_filter = self.var_host_filter.get()
         ftext = self.var_filter_text.get().lower()
+        use_regex = self.var_filter_regex.get()
         show_filtered = self.var_show_filtered.get()
         show_closed = self.var_show_closed.get()
         sort_val = self.var_sort.get()
+
+        # Compile regex if needed
+        regex_pattern = None
+        if ftext and use_regex:
+            try:
+                regex_pattern = re.compile(ftext, re.IGNORECASE)
+            except re.error:
+                self._log(f"Invalid regex: {ftext}", "error")
+                regex_pattern = None
 
         all_rows = []
         for result in self.scan_results:
@@ -1604,8 +1823,14 @@ class NexScanApp(tk.Tk):
 
                 banner_short = p.banner.splitlines()[0][:80] if p.banner else ""
                 row_str = f"{result.target} {p.port} {p.protocol} {p.state.value} {p.service} {p.version} {banner_short}".lower()
-                if ftext and ftext not in row_str:
-                    continue
+
+                # Apply filter
+                if ftext:
+                    if use_regex and regex_pattern:
+                        if not regex_pattern.search(row_str):
+                            continue
+                    elif not use_regex and ftext not in row_str:
+                        continue
 
                 all_rows.append((result.target, p, tag, banner_short))
 
@@ -1952,7 +2177,7 @@ class NexScanApp(tk.Tk):
         popup = tk.Toplevel(self)
         popup.title("About NexScan")
         popup.configure(bg=C["bg"])
-        popup.geometry("480x360")
+        popup.geometry("580x480")
         popup.resizable(False, False)
 
         txt = tk.Text(
@@ -1977,6 +2202,26 @@ class NexScanApp(tk.Tk):
             txt.tag_configure(tag, foreground=fg_c, font=fnt)
 
         txt.insert("end", f"◈ NEXSCAN\n", "h1")
+        txt.insert("end", f"v{self.VERSION} — Advanced Port Scanner\n\n", "val")
+        txt.insert("end", "KEYBOARD SHORTCUTS\n", "h2")
+        txt.insert("end", "F5              Start scan\n", "key")
+        txt.insert("end", "Escape          Stop/Cancel scan\n", "key")
+        txt.insert("end", "Ctrl+E          Export results\n", "key")
+        txt.insert("end", "Ctrl+L          Clear results\n", "key")
+        txt.insert("end", "Ctrl+F          Focus filter box\n", "key")
+        txt.insert("end", "Ctrl+S          Save profile\n", "key")
+        txt.insert("end", "Ctrl+O          Load profile\n\n", "key")
+        txt.insert("end", "FEATURES\n", "h2")
+        txt.insert("end", "✓ Multi-protocol scanning (TCP/UDP/SYN)\n", "val")
+        txt.insert("end", "✓ Real-time progress with ETA\n", "val")
+        txt.insert("end", "✓ Regex & text filtering\n", "val")
+        txt.insert("end", "✓ Service detection & OS fingerprinting\n", "val")
+        txt.insert("end", "✓ SSL/TLS certificate inspection\n", "val")
+        txt.insert("end", "✓ Multiple export formats\n", "val")
+        txt.insert("end", "✓ Live event logging\n\n", "val")
+        txt.insert("end", "For authorized use only. Respect applicable laws.\n", "key")
+
+        txt.configure(state="disabled")
         txt.insert("end", f"  Advanced Port Scanner v{self.VERSION}\n\n", "key")
         txt.insert("end", "CAPABILITIES\n", "h2")
         features = [
@@ -2010,12 +2255,82 @@ class NexScanApp(tk.Tk):
             popup, "  Close  ", popup.destroy, fg=C["text"], bg=C["btn_bg"], hover_bg=C["btn_hover"]
         ).pack(pady=10)
 
+    def _save_profile(self):
+        """Save current scan configuration as a profile."""
+        import json
+
+        file = filedialog.asksaveasfilename(
+            defaultextension=".json",
+            filetypes=[("NexScan Profile", "*.json"), ("All Files", "*.*")],
+            initialfile="nexscan_profile.json",
+        )
+        if not file:
+            return
+
+        profile = {
+            "targets": self.txt_targets.get("1.0", "end").strip(),
+            "ports": self.txt_ports.get("1.0", "end").strip(),
+            "scan_type": self.var_scan_type.get(),
+            "threads": self.var_threads.get(),
+            "timeout": self.var_timeout.get(),
+            "connect_timeout": self.var_connect_timeout.get(),
+            "banner_grab": self.var_banner_grab.get(),
+            "service_detect": self.var_service_detect.get(),
+            "os_detect": self.var_os_detect.get(),
+            "ssl_probe": self.var_ssl_probe.get(),
+            "host_discovery": self.var_host_discovery.get(),
+        }
+        try:
+            with open(file, "w") as f:
+                json.dump(profile, f, indent=2)
+            self._log(f"Profile saved to {file}", "info")
+            messagebox.showinfo("Success", f"Profile saved to\n{file}")
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to save profile: {e}")
+
+    def _load_profile(self):
+        """Load a saved scan configuration profile."""
+        import json
+
+        file = filedialog.askopenfilename(
+            filetypes=[("NexScan Profile", "*.json"), ("All Files", "*.*")]
+        )
+        if not file:
+            return
+
+        try:
+            with open(file, "r") as f:
+                profile = json.load(f)
+
+            self.txt_targets.delete("1.0", "end")
+            self.txt_targets.insert("1.0", profile.get("targets", ""))
+
+            self.txt_ports.delete("1.0", "end")
+            self.txt_ports.insert("1.0", profile.get("ports", ""))
+
+            self.var_scan_type.set(profile.get("scan_type", "TCP Connect"))
+            self.var_threads.set(profile.get("threads", 300))
+            self.var_timeout.set(profile.get("timeout", 1.5))
+            self.var_connect_timeout.set(profile.get("connect_timeout", 3.0))
+            self.var_banner_grab.set(profile.get("banner_grab", True))
+            self.var_service_detect.set(profile.get("service_detect", True))
+            self.var_os_detect.set(profile.get("os_detect", False))
+            self.var_ssl_probe.set(profile.get("ssl_probe", True))
+            self.var_host_discovery.set(profile.get("host_discovery", True))
+
+            self._log(f"Profile loaded from {file}", "info")
+            messagebox.showinfo("Success", f"Profile loaded from\n{file}")
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to load profile: {e}")
+
     def _setup_bindings(self):
         self.bind("<F5>", lambda e: self._start_scan())
         self.bind("<Escape>", lambda e: self._stop_scan())
         self.bind("<Control-e>", lambda e: self._export_menu())
         self.bind("<Control-l>", lambda e: self._clear_results())
         self.bind("<Control-f>", lambda e: self.entry_filter.focus())
+        self.bind("<Control-s>", lambda e: self._save_profile())
+        self.bind("<Control-o>", lambda e: self._load_profile())
 
     def _on_close(self):
         if self.is_scanning:

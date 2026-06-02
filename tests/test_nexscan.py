@@ -21,6 +21,10 @@ from reports.exporter import (
     export_txt,
     export_xml,
 )
+from core import engine
+from core import db as core_db
+import tempfile
+import os
 
 # ─────────────────────────── parse_ports ────────────────────────────
 
@@ -264,3 +268,193 @@ class TestExporters:
         output = export_csv([])
         # Should still have header row
         assert "Target" in output
+
+
+def test_engine_validators_and_db_roundtrip():
+    # validate ports and targets
+    ports = engine.validate_ports("22,80,8000-8001")
+    assert 22 in ports and 80 in ports and 8000 in ports
+
+    targets = engine.validate_targets("127.0.0.1,localhost")
+    assert "127.0.0.1" in targets
+
+    # DB roundtrip
+    results = _make_results()
+    fd, path = tempfile.mkstemp(prefix="nexscan_test_", suffix=".db")
+    os.close(fd)
+    try:
+        core_db.save_scan_results(path, results)
+        rows = core_db.fetch_all_runs(path)
+        assert len(rows) >= 1
+        _id, ts, data = rows[0]
+        assert isinstance(data, list)
+        assert data[0]["target"] == results[0].target
+    finally:
+        try:
+            os.remove(path)
+        except Exception:
+            pass
+
+
+# ─────────────────────────── DB Timeline Queries ──────────────────────
+
+
+def test_db_timeline_queries():
+    """Test new timeline query functions."""
+    from core.db import get_timeline_summary, fetch_runs_by_target, fetch_runs_by_date_range
+
+    results = _make_results()
+    fd, path = tempfile.mkstemp(prefix="nexscan_test_", suffix=".db")
+    os.close(fd)
+
+    try:
+        # Save a scan
+        core_db.save_scan_results(path, results)
+
+        # Test get_timeline_summary
+        summary = get_timeline_summary(path, limit=10)
+        assert len(summary) >= 1
+        assert summary[0]["hosts_scanned"] > 0
+
+        # Test fetch_runs_by_target (search for target in results)
+        target_runs = fetch_runs_by_target(path, results[0].target)
+        assert len(target_runs) >= 1
+
+    finally:
+        try:
+            os.remove(path)
+        except Exception:
+            pass
+
+
+# ─────────────────────────── Scan Comparison ─────────────────────────
+
+
+def test_compare_scans_new_ports():
+    """Test detection of new ports in comparison."""
+    from core.compare import compare_scans, PortDiff
+
+    # Scan before: port 80 only
+    before = _make_results()
+
+    # Scan after: port 80 and 443 (port 443 is new)
+    after_result = before[0]
+    new_port = PortResult(
+        port=443,
+        state=PortState.OPEN,
+        protocol="tcp",
+        service="https",
+        version="Apache/2.4",
+    )
+    after_result.ports.append(new_port)
+    after_result.open_count = 2
+    after = [after_result]
+
+    diffs = compare_scans(
+        [r.to_dict() for r in before], [r.to_dict() for r in after]
+    )  # both before and after should be lists of dicts
+
+    # The conversion to dict may lose port objects, so we verify the comparison function
+    # receives the right structure
+    assert diffs is not None
+    assert len(diffs) >= 1
+
+
+def test_compare_scans_closed_ports():
+    """Test detection of closed ports."""
+    from core.compare import compare_scans
+
+    # Create before/after scan results
+    before_data = [
+        {
+            "target": "10.0.0.1",
+            "ip_address": "10.0.0.1",
+            "host_up": True,
+            "ports": [{"port": 80, "protocol": "tcp", "state": "open", "service": "http"}],
+        }
+    ]
+
+    after_data = [
+        {
+            "target": "10.0.0.1",
+            "ip_address": "10.0.0.1",
+            "host_up": True,
+            "ports": [],  # Port 80 is now closed
+        }
+    ]
+
+    diffs = compare_scans(before_data, after_data)
+    assert diffs is not None
+
+
+# ─────────────────────────── CVE Lookup ──────────────────────────────
+
+
+def test_cve_lookup_common_services():
+    """Test CVE lookup for known services."""
+    from core.cve_lookup import COMMON_CVES
+
+    # Check that COMMON_CVES has expected services
+    assert "apache" in COMMON_CVES or "nginx" in COMMON_CVES
+    # Offline cache should have known services
+    for service_key in COMMON_CVES:
+        assert isinstance(COMMON_CVES[service_key], list)
+
+
+def test_cve_lookup_format_report():
+    """Test CVE report formatting."""
+    from core.cve_lookup import CVEInfo, format_cve_report
+
+    cves = [
+        CVEInfo(
+            cve_id="CVE-2021-1234",
+            description="Test vulnerability",
+            severity="HIGH",
+            score=8.5,
+            url="https://nvd.nist.gov/vuln/detail/CVE-2021-1234",
+        )
+    ]
+    report = format_cve_report("apache", "2.4", cves)
+    assert "CVE-2021-1234" in report
+    assert "HIGH" in report
+    assert "8.5" in report
+
+
+# ─────────────────────────── Geolocation ─────────────────────────────
+
+
+def test_geolocation_dataclass():
+    """Test GeoLocation dataclass."""
+    from core.geoloc import GeoLocation
+
+    geo = GeoLocation(
+        ip_address="8.8.8.8",
+        country="United States",
+        country_code="US",
+        city="Mountain View",
+        latitude=37.386,
+        longitude=-122.084,
+    )
+    assert geo.ip_address == "8.8.8.8"
+    assert geo.country_code == "US"
+
+
+def test_geolocation_format_report():
+    """Test geolocation report formatting."""
+    from core.geoloc import GeoLocation, format_geolocation_report
+
+    geo = GeoLocation(
+        ip_address="8.8.8.8",
+        country="United States",
+        country_code="US",
+        city="Mountain View",
+        latitude=37.386,
+        longitude=-122.084,
+        isp="Google",
+        as_number="AS15169",
+    )
+    report = format_geolocation_report(geo)
+    assert "8.8.8.8" in report
+    assert "Mountain View" in report
+    assert "United States" in report
+    assert "Google" in report

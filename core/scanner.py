@@ -242,28 +242,22 @@ class PortScanner:
         start = time.perf_counter()
 
         try:
-            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.settimeout(self.config.connect_timeout)
-            ret = sock.connect_ex((host, port))
-            elapsed = time.perf_counter() - start
-            result.response_time = elapsed
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+                sock.settimeout(self.config.connect_timeout)
+                ret = sock.connect_ex((host, port))
+                elapsed = time.perf_counter() - start
+                result.response_time = elapsed
 
-            if ret == 0:
-                result.state = PortState.OPEN
-                if self.config.grab_banners:
-                    result.banner = self._grab_banner(sock, host, port)
-                if self.config.ssl_probe and port in (443, 8443, 465, 993, 995, 636):
-                    result.ssl_info = self._probe_ssl(host, port)
-                sock.close()
-            elif ret in (111, 10061):  # connection refused
-                result.state = PortState.CLOSED
-                sock.close()
-            else:
-                result.state = PortState.FILTERED
-                try:
-                    sock.close()
-                except Exception:
-                    pass
+                if ret == 0:
+                    result.state = PortState.OPEN
+                    if self.config.grab_banners:
+                        result.banner = self._grab_banner(sock, host, port)
+                    if self.config.ssl_probe and port in (443, 8443, 465, 993, 995, 636):
+                        result.ssl_info = self._probe_ssl(host, port)
+                elif ret in (111, 10061):  # connection refused
+                    result.state = PortState.CLOSED
+                else:
+                    result.state = PortState.FILTERED
         except socket.timeout:
             result.state = PortState.FILTERED
         except ConnectionRefusedError:
@@ -286,22 +280,21 @@ class PortScanner:
 
         probe = self._get_udp_probe(port)
         try:
-            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            sock.settimeout(self.config.timeout)
-            sock.sendto(probe, (host, port))
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+                sock.settimeout(self.config.timeout)
+                sock.sendto(probe, (host, port))
 
-            try:
-                data, _ = sock.recvfrom(1024)
-                result.state = PortState.OPEN
-                result.banner = data[:200].decode("utf-8", errors="replace").strip()
-                result.response_time = time.perf_counter() - start
-            except socket.timeout:
-                # No response could mean open|filtered
-                result.state = PortState.OPEN_FILTERED
-                result.response_time = time.perf_counter() - start
-            sock.close()
+                try:
+                    data, _ = sock.recvfrom(1024)
+                    result.state = PortState.OPEN
+                    result.banner = data[:200].decode("utf-8", errors="replace").strip()
+                    result.response_time = time.perf_counter() - start
+                except socket.timeout:
+                    # No response could mean open|filtered
+                    result.state = PortState.OPEN_FILTERED
+                    result.response_time = time.perf_counter() - start
         except OSError as e:
-            if "ICMP" in str(e) or e.errno in (111, 10054):
+            if "ICMP" in str(e) or getattr(e, "errno", None) in (111, 10054):
                 result.state = PortState.CLOSED
             else:
                 result.state = PortState.OPEN_FILTERED
