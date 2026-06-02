@@ -38,9 +38,12 @@ def compare_scans(scan_before: List[ScanResult], scan_after: List[ScanResult]) -
     """
     diffs = []
 
-    # Build lookup maps
-    before_map = {r.target: r for r in scan_before}
-    after_map = {r.target: r for r in scan_after}
+    # Build lookup maps (handle both dict and object types)
+    def get_target(r):
+        return r.get("target") if isinstance(r, dict) else r.target
+
+    before_map = {get_target(r): r for r in scan_before}
+    after_map = {get_target(r): r for r in scan_after}
 
     # Get union of all hosts
     all_hosts = set(before_map.keys()) | set(after_map.keys())
@@ -49,12 +52,18 @@ def compare_scans(scan_before: List[ScanResult], scan_after: List[ScanResult]) -
         before = before_map.get(host)
         after = after_map.get(host)
 
+        # Helper to get attributes from both dict and object
+        def get_attr(obj, key):
+            return obj.get(key) if isinstance(obj, dict) else getattr(obj, key)
+
         # Host status change
         status_change = ""
         if before and after:
-            if before.host_up and not after.host_up:
+            before_up = get_attr(before, "host_up")
+            after_up = get_attr(after, "host_up")
+            if before_up and not after_up:
                 status_change = "down"
-            elif not before.host_up and after.host_up:
+            elif not before_up and after_up:
                 status_change = "up"
             else:
                 status_change = "unchanged"
@@ -63,7 +72,7 @@ def compare_scans(scan_before: List[ScanResult], scan_after: List[ScanResult]) -
         elif before and not after:
             status_change = "not_in_recent"
 
-        ip_address = (after or before).ip_address
+        ip_address = get_attr(after or before, "ip_address")
 
         # Port-level diffs
         port_diffs = []
