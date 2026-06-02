@@ -93,11 +93,27 @@ def compare_scans(scan_before: List[ScanResult], scan_after: List[ScanResult]) -
 
 
 def _diff_ports(before: ScanResult, after: ScanResult) -> List[PortDiff]:
-    """Compare ports between two scans."""
+    """Compare ports between two scans (handles both dict and object inputs)."""
     diffs = []
 
-    before_map = {(p.port, p.protocol): p for p in before.ports}
-    after_map = {(p.port, p.protocol): p for p in after.ports}
+    def get_ports(obj):
+        return obj.get("ports", []) if isinstance(obj, dict) else obj.ports
+
+    def pa(p, key):
+        return p.get(key) if isinstance(p, dict) else getattr(p, key)
+
+    def state_value(p):
+        state = pa(p, "state")
+        return state.value if hasattr(state, "value") else state
+
+    def is_open(p):
+        state = pa(p, "state")
+        if isinstance(state, str):
+            return state in ("open", "open|filtered")
+        return state in (PortState.OPEN, PortState.OPEN_FILTERED)
+
+    before_map = {(pa(p, "port"), pa(p, "protocol")): p for p in get_ports(before)}
+    after_map = {(pa(p, "port"), pa(p, "protocol")): p for p in get_ports(after)}
 
     all_keys = set(before_map.keys()) | set(after_map.keys())
 
@@ -107,52 +123,54 @@ def _diff_ports(before: ScanResult, after: ScanResult) -> List[PortDiff]:
 
         if before_p and after_p:
             # Port existed in both
-            if before_p.state != after_p.state:
+            if state_value(before_p) != state_value(after_p):
                 diffs.append(
                     PortDiff(
                         port=port,
                         protocol=protocol,
                         change_type="state_changed",
-                        old_state=before_p.state.value,
-                        new_state=after_p.state.value,
+                        old_state=state_value(before_p),
+                        new_state=state_value(after_p),
                     )
                 )
-            elif before_p.service != after_p.service or before_p.version != after_p.version:
+            elif pa(before_p, "service") != pa(after_p, "service") or pa(before_p, "version") != pa(
+                after_p, "version"
+            ):
                 diffs.append(
                     PortDiff(
                         port=port,
                         protocol=protocol,
                         change_type="service_changed",
-                        old_service=before_p.service,
-                        new_service=after_p.service,
-                        old_version=before_p.version,
-                        new_version=after_p.version,
+                        old_service=pa(before_p, "service") or "",
+                        new_service=pa(after_p, "service") or "",
+                        old_version=pa(before_p, "version") or "",
+                        new_version=pa(after_p, "version") or "",
                     )
                 )
         elif after_p and not before_p:
             # New port (if open/filtered)
-            if after_p.state in (PortState.OPEN, PortState.OPEN_FILTERED):
+            if is_open(after_p):
                 diffs.append(
                     PortDiff(
                         port=port,
                         protocol=protocol,
                         change_type="new",
-                        new_state=after_p.state.value,
-                        new_service=after_p.service,
-                        new_version=after_p.version,
+                        new_state=state_value(after_p),
+                        new_service=pa(after_p, "service") or "",
+                        new_version=pa(after_p, "version") or "",
                     )
                 )
         elif before_p and not after_p:
             # Port closed/disappeared
-            if before_p.state in (PortState.OPEN, PortState.OPEN_FILTERED):
+            if is_open(before_p):
                 diffs.append(
                     PortDiff(
                         port=port,
                         protocol=protocol,
                         change_type="closed",
-                        old_state=before_p.state.value,
-                        old_service=before_p.service,
-                        old_version=before_p.version,
+                        old_state=state_value(before_p),
+                        old_service=pa(before_p, "service") or "",
+                        old_version=pa(before_p, "version") or "",
                     )
                 )
 
