@@ -74,6 +74,7 @@ ignore = [
     "E501",  # line too long — handled by Black
     "E702",  # multiple statements on one line (semicolons used intentionally in GUI code)
     "E731",  # lambda assignments — used intentionally for scan_fn dispatch
+    "F841",  # local variable assigned but never used
     "W293",  # whitespace on blank line
 ]
 
