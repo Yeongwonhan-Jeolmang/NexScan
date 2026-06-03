@@ -3,7 +3,11 @@
 import datetime
 import json
 import sqlite3
-from typing import Iterable, List, Tuple
+from typing import Iterable, List, Optional, Protocol, Tuple
+
+
+class _HasToDict(Protocol):
+    def to_dict(self) -> dict: ...
 
 
 def _ensure_db(path: str):
@@ -20,7 +24,7 @@ def _ensure_db(path: str):
     conn.close()
 
 
-def save_scan_results(path: str, results: Iterable[object]):
+def save_scan_results(path: str, results: Iterable[_HasToDict]):
     _ensure_db(path)
     conn = sqlite3.connect(path)
     cur = conn.cursor()
@@ -78,7 +82,7 @@ def fetch_runs_by_date_range(
     return [(r[0], r[1], json.loads(r[2])) for r in rows]
 
 
-def fetch_run_by_id(path: str, run_id: int) -> Tuple[int, str, list]:
+def fetch_run_by_id(path: str, run_id: int) -> Optional[Tuple[int, str, list]]:
     """Fetch a specific scan run by ID."""
     _ensure_db(path)
     conn = sqlite3.connect(path)

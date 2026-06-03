@@ -33,7 +33,7 @@ def _check_privileges_for_scan(scan_type: ScanType):
                 # Windows: best-effort admin check
                 import ctypes
 
-                if not ctypes.windll.shell32.IsUserAnAdmin():
+                if not ctypes.windll.shell32.IsUserAnAdmin():  # type: ignore[attr-defined]
                     raise PrivilegeError("SYN scan requires administrator privileges on Windows")
             else:
                 if os.geteuid() != 0:

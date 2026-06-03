@@ -1,7 +1,7 @@
 """Scan comparison and diff utility."""
 
 from dataclasses import dataclass
-from typing import List
+from typing import List, Optional
 
 from core.scanner import PortState, ScanResult
 
@@ -24,7 +24,7 @@ class HostDiff:
     target: str
     ip_address: str
     status_change: str = ""  # "up_to_down", "down_to_up", "unchanged"
-    port_diffs: List[PortDiff] = None
+    port_diffs: Optional[List[PortDiff]] = None
 
     def __post_init__(self):
         if self.port_diffs is None:

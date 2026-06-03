@@ -1,6 +1,7 @@
 """CVE vulnerability lookup integration."""
 
 import json
+import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 from typing import List
