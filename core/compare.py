@@ -192,7 +192,7 @@ def generate_diff_report(diffs: List[HostDiff]) -> str:
 
     # Summary
     host_changes = sum(1 for d in diffs if d.status_change in ("up", "down"))
-    port_changes = sum(len(d.port_diffs) for d in diffs)
+    port_changes = sum(len(d.port_diffs or []) for d in diffs)
     lines.append(f"  Changes: {host_changes} hosts | {port_changes} ports")
     lines.append("")
 
@@ -205,7 +205,7 @@ def generate_diff_report(diffs: List[HostDiff]) -> str:
             )
             lines.append(f"    {icon} Status: {diff.status_change.upper()}")
 
-        for pd in diff.port_diffs:
+        for pd in diff.port_diffs or []:
             if pd.change_type == "new":
                 lines.append(
                     f"    ✚ NEW: {pd.port}/{pd.protocol} → {pd.new_state}  "
