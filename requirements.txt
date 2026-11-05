@@ -1,9 +1,12 @@
-# NexScan v2.0 — Runtime dependencies
+# NexScan v3.0 — Runtime dependencies
 # No third-party packages are required for normal use.
 # tkinter ships with CPython; install the system package if missing:
 #   Debian/Ubuntu:  sudo apt-get install python3-tk
 #   Fedora:         sudo dnf install python3-tkinter
 #   macOS Homebrew: brew install python-tk
+#
+# Optional — more robust TLS certificate parsing (stdlib fallback otherwise):
+#   cryptography>=41
 
 # ── Development / testing dependencies ───────────────────────────────
 # Install with: pip install -r requirements-dev.txt

@@ -1,21 +1,28 @@
 """
 NexScan - Core Scanner Engine
-Handles TCP connect, SYN (raw), UDP scanning with threading, banner grabbing,
-service fingerprinting, and OS detection.
+Handles TCP connect, raw (SYN / ACK / FIN / XMAS / NULL / Window) and UDP
+scanning with a shared worker pool, banner grabbing, service fingerprinting,
+and OS detection.
 """
 
 import concurrent.futures
+import datetime
+import errno
 import ipaddress
-import select
+import itertools
+import random
+import selectors
 import socket
 import ssl
 import struct
 import threading
 import time
+from collections import Counter
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Callable, Optional
 
+from core import fingerprint
 from core.service_db import ServiceDatabase
 from utils.logger import get_logger
 
@@ -38,7 +45,34 @@ class PortState(Enum):
     CLOSED = "closed"
     FILTERED = "filtered"
     OPEN_FILTERED = "open|filtered"
+    UNFILTERED = "unfiltered"
     UNRESPONSIVE = "unresponsive"
+
+
+RAW_SCAN_TYPES = {
+    ScanType.SYN_STEALTH,
+    ScanType.ACK,
+    ScanType.FIN,
+    ScanType.XMAS,
+    ScanType.NULL,
+    ScanType.WINDOW,
+}
+
+# errno values meaning "connection refused" (Linux 111, macOS/BSD 61, Windows 10061)
+_REFUSED = {errno.ECONNREFUSED, 111, 61, 10061}
+# Transient local resource errors worth retrying instead of reporting "filtered"
+_RESOURCE_ERRORS = {errno.EMFILE, errno.ENFILE, errno.ENOBUFS, errno.EADDRNOTAVAIL}
+
+TLS_PORTS = {443, 465, 636, 853, 990, 992, 993, 994, 995, 5986, 6443, 8443, 9443}
+_HTTPS_PORTS = {443, 6443, 8443, 9443, 5986}
+_HTTP_PORTS = {80, 81, 591, 3000, 5000, 8000, 8008, 8080, 8081, 8088, 8888, 9000, 9090}
+
+_HTTP_PROBE = (
+    b"HEAD / HTTP/1.1\r\nHost: {host}\r\nUser-Agent: NexScan/3.0\r\nConnection: close\r\n\r\n"
+)
+
+# Maximum hosts produced by a single CIDR / range expression
+MAX_EXPANDED_HOSTS = 256
 
 
 @dataclass
@@ -68,6 +102,26 @@ class PortResult:
             "extra_info": self.extra_info,
         }
 
+    @classmethod
+    def from_dict(cls, data: dict) -> "PortResult":
+        """Rebuild a PortResult from :meth:`to_dict` output (e.g. scan history)."""
+        try:
+            state = PortState(data.get("state", "filtered"))
+        except ValueError:
+            state = PortState.FILTERED
+        return cls(
+            port=int(data.get("port", 0)),
+            state=state,
+            protocol=data.get("protocol", "tcp"),
+            service=data.get("service", "") or "",
+            version=data.get("version", "") or "",
+            banner=data.get("banner", "") or "",
+            response_time=float(data.get("response_time", 0.0) or 0.0),
+            ssl_info=data.get("ssl_info"),
+            cpe=data.get("cpe", "") or "",
+            extra_info=data.get("extra_info", "") or "",
+        )
+
 
 @dataclass
 class ScanConfig:
@@ -75,20 +129,21 @@ class ScanConfig:
     ports: list = field(default_factory=list)
     scan_type: ScanType = ScanType.TCP_CONNECT
     threads: int = 200
-    timeout: float = 1.5
-    connect_timeout: float = 3.0
+    timeout: float = 1.5  # UDP / raw reply wait
+    connect_timeout: float = 3.0  # TCP connect timeout
     grab_banners: bool = True
     detect_service: bool = True
     detect_os: bool = False
     ssl_probe: bool = True
     rate_limit: float = 0.0  # seconds between packets (0 = no limit)
-    retry_count: int = 1
+    retry_count: int = 1  # attempts per probe for UDP / raw scans (min 1)
     jitter: float = 0.0  # random delay jitter ms
     max_banner_wait: float = 2.0
     udp_payload_probes: bool = True
     follow_redirects: bool = False
     host_discovery: bool = True
     host_discovery_timeout: float = 1.0
+    reverse_dns: bool = True
 
 
 @dataclass
@@ -111,7 +166,7 @@ class ScanResult:
     extra: dict = field(default_factory=dict)
 
     def to_dict(self):
-        return {
+        data = {
             "target": self.target,
             "hostname": self.hostname,
             "ip_address": self.ip_address,
@@ -128,24 +183,68 @@ class ScanResult:
             "timestamp": self.timestamp,
             "ttl": self.ttl,
         }
+        if self.extra:
+            data["extra"] = self.extra
+        return data
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "ScanResult":
+        """Rebuild a ScanResult from :meth:`to_dict` output (e.g. scan history)."""
+        known = {f for f in cls.__dataclass_fields__ if f != "ports"}
+        kwargs = {k: v for k, v in data.items() if k in known}
+        kwargs.setdefault("target", data.get("ip_address", ""))
+        result = cls(**kwargs)
+        result.ports = [PortResult.from_dict(p) for p in data.get("ports", [])]
+        return result
+
+
+@dataclass
+class _HostJob:
+    """Book-keeping for one host while its ports are in flight."""
+
+    index: int
+    result: ScanResult
+    sni: Optional[str]
+    remaining: int
+    done: int = 0
+    start: float = 0.0
+    port_results: list = field(default_factory=list)
+
+
+def _raise_fd_limit() -> int:
+    """Raise the soft open-file limit as far as allowed. Returns the new soft limit."""
+    try:
+        import resource
+    except ImportError:  # Windows
+        return 8192
+    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    target = hard if hard != resource.RLIM_INFINITY else 65536
+    target = min(target, 65536)
+    if soft < target:
+        try:
+            resource.setrlimit(resource.RLIMIT_NOFILE, (target, hard))
+            soft = target
+        except (ValueError, OSError):
+            pass
+    return soft
+
+
+def _family_for(ip: str) -> int:
+    return socket.AF_INET6 if ":" in ip else socket.AF_INET
 
 
 class PortScanner:
     """Main scanning engine with pluggable scan strategies."""
 
     COMMON_BANNERS = {
-        21: b"",
-        22: b"",
         25: b"EHLO nexscan.local\r\n",
-        80: b"HEAD / HTTP/1.1\r\nHost: {host}\r\nUser-Agent: NexScan/2.0\r\nConnection: close\r\n\r\n",
-        110: b"",
-        143: b"",
-        443: b"HEAD / HTTP/1.1\r\nHost: {host}\r\nUser-Agent: NexScan/2.0\r\nConnection: close\r\n\r\n",
-        3306: b"",
-        5432: b"",
+        80: _HTTP_PROBE,
+        443: _HTTP_PROBE,
         6379: b"PING\r\n",
-        27017: b"",
     }
+
+    # Services that wait for the client to speak first (skip the passive read)
+    _CLIENT_FIRST = _HTTP_PORTS | {6379, 11211}
 
     def __init__(
         self,
@@ -163,12 +262,25 @@ class PortScanner:
         self._pause_event = threading.Event()
         self._pause_event.set()
         self._lock = threading.Lock()
+        self._rate_lock = threading.Lock()
+        self._next_slot = 0.0
         self._completed = 0
         self._total = 0
+        self._raw = None
         self.results = []
+
+        # Every worker may hold a socket (plus one for TLS) — keep within fd limits.
+        fd_limit = _raise_fd_limit()
+        max_threads = max(1, (fd_limit - 64) // 2)
+        if config.threads > max_threads:
+            logger.warning(
+                f"Reducing threads from {config.threads} to {max_threads} (open-file limit)"
+            )
+            config.threads = max_threads
 
     def stop(self):
         self._stop_event.set()
+        self._pause_event.set()  # release paused workers so they can exit
 
     def pause(self):
         self._pause_event.clear()
@@ -179,49 +291,118 @@ class PortScanner:
     def is_stopped(self):
         return self._stop_event.is_set()
 
-    def resolve_target(self, target: str) -> tuple[str, str]:
+    @property
+    def is_paused(self) -> bool:
+        return not self._pause_event.is_set()
+
+    # ─────────────────────────── DISCOVERY ───────────────────────────
+
+    def resolve_target(self, target: str, reverse: Optional[bool] = None) -> tuple[str, str]:
         """Resolve hostname to IP. Returns (ip, hostname)."""
+        reverse = self.config.reverse_dns if reverse is None else reverse
         try:
-            ip = socket.gethostbyname(target)
+            ipaddress.ip_address(target)
+            ip = target
+        except ValueError:
+            try:
+                infos = socket.getaddrinfo(target, None, type=socket.SOCK_STREAM)
+            except socket.gaierror:
+                return target, target
+            infos.sort(key=lambda i: 0 if i[0] == socket.AF_INET else 1)
+            ip = str(infos[0][4][0])
+
+        hostname = target if target != ip else ""
+        if reverse:
             try:
                 hostname = socket.gethostbyaddr(ip)[0]
-            except Exception:
-                hostname = target if target != ip else ""
-            return ip, hostname
-        except socket.gaierror:
-            return target, target
+            except (OSError, UnicodeError):
+                pass
+        return ip, hostname
 
     def check_host_up(self, ip: str) -> tuple[bool, int]:
-        """Quick TCP probe to check if host responds. Returns (up, ttl)."""
-        probe_ports = [80, 443, 22, 21, 8080, 3389, 25, 53]
-        for port in probe_ports:
-            try:
-                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                sock.settimeout(self.config.host_discovery_timeout)
-                result = sock.connect_ex((ip, port))
-                sock.close()
-                if result in (0, 111):  # connected or refused = host up
-                    return True, 64
-            except Exception:
-                pass
+        """
+        Probe common ports in parallel (non-blocking) to check if a host responds,
+        falling back to an ICMP echo when privileged. Returns (up, ttl);
+        ttl is 0 when it could not be measured.
+        """
+        probe_ports = [80, 443, 22, 21, 8080, 3389, 25, 53, 445, 139]
+        timeout = self.config.host_discovery_timeout
+        family = _family_for(ip)
+        sel = selectors.DefaultSelector()
+        socks = []
+        up = False
 
-        # ICMP ping fallback
+        try:
+            for port in probe_ports:
+                try:
+                    s = socket.socket(family, socket.SOCK_STREAM)
+                except OSError:
+                    continue
+                s.setblocking(False)
+                socks.append(s)
+                try:
+                    err = s.connect_ex((ip, port))
+                except OSError:
+                    continue
+                if err == 0 or err in _REFUSED:
+                    up = True
+                    break
+                sel.register(s, selectors.EVENT_WRITE)
+
+            deadline = time.perf_counter() + timeout
+            while not up and sel.get_map():
+                remaining = deadline - time.perf_counter()
+                if remaining <= 0:
+                    break
+                for key, _ in sel.select(remaining):
+                    probe: socket.socket = key.fileobj  # type: ignore[assignment]
+                    err = probe.getsockopt(socket.SOL_SOCKET, socket.SO_ERROR)
+                    sel.unregister(probe)
+                    if err == 0 or err in _REFUSED:
+                        up = True
+                        break
+        finally:
+            sel.close()
+            for s in socks:
+                s.close()
+
+        ttl = 0
+        if family == socket.AF_INET and (not up or self.config.detect_os):
+            icmp_up, ttl = self._icmp_ping(ip, timeout if not up else min(timeout, 0.6))
+            up = up or icmp_up
+        return up, ttl
+
+    def _icmp_ping(self, ip: str, timeout: float) -> tuple[bool, int]:
+        """ICMP echo (needs root). Returns (got_reply, ttl)."""
         try:
             sock = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_ICMP)
-            sock.settimeout(self.config.host_discovery_timeout)
-            # ICMP echo request
-            packet = struct.pack("!BBHHH4s", 8, 0, 0, 1, 1, b"\x00" * 4)
-            checksum = self._icmp_checksum(packet)
-            packet = struct.pack("!BBHHH", 8, 0, checksum, 1, 1)
-            sock.sendto(packet, (ip, 0))
-            data, _ = sock.recvfrom(1024)
-            sock.close()
-            if len(data) >= 20:
-                ttl = data[8]
-                return True, ttl
-        except Exception:
-            pass
+        except OSError:
+            return False, 0
 
+        ident = random.randint(1, 0xFFFF)
+        payload = b"NexScan!"
+        header = struct.pack("!BBHHH", 8, 0, 0, ident, 1)
+        packet = struct.pack("!BBHHH", 8, 0, self._icmp_checksum(header + payload), ident, 1)
+        packet += payload
+
+        try:
+            sock.settimeout(timeout)
+            sock.sendto(packet, (ip, 0))
+            deadline = time.perf_counter() + timeout
+            while time.perf_counter() < deadline:
+                sock.settimeout(max(0.01, deadline - time.perf_counter()))
+                data, addr = sock.recvfrom(1024)
+                ihl = (data[0] & 0x0F) * 4
+                if addr[0] != ip or len(data) < ihl + 8:
+                    continue
+                icmp_type = data[ihl]
+                recv_id = struct.unpack("!H", data[ihl + 4 : ihl + 6])[0]
+                if icmp_type == 0 and recv_id == ident:
+                    return True, data[8]
+        except OSError:
+            pass
+        finally:
+            sock.close()
         return False, 0
 
     def _icmp_checksum(self, data: bytes) -> int:
@@ -235,65 +416,111 @@ class PortScanner:
         s += s >> 16
         return ~s & 0xFFFF
 
-    def scan_port_tcp(self, host: str, port: int) -> PortResult:
+    # ─────────────────────────── PACING ───────────────────────────
+
+    def _throttle(self) -> bool:
+        """Honour pause / rate-limit / jitter before a probe. Returns False if stopped."""
+        self._pause_event.wait()
+        if self._stop_event.is_set():
+            return False
+
+        if self.config.rate_limit > 0:
+            with self._rate_lock:
+                now = time.perf_counter()
+                slot = max(now, self._next_slot)
+                self._next_slot = slot + self.config.rate_limit
+            if slot > now:
+                time.sleep(slot - now)
+
+        if self.config.jitter > 0:
+            time.sleep(random.uniform(0, self.config.jitter / 1000.0))
+        return not self._stop_event.is_set()
+
+    # ─────────────────────────── PROBES ───────────────────────────
+
+    def scan_port_tcp(self, host: str, port: int, sni: Optional[str] = None) -> PortResult:
         """TCP connect scan."""
         result = PortResult(port=port, state=PortState.FILTERED, protocol="tcp")
+        family = _family_for(host)
         start = time.perf_counter()
 
-        try:
-            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-                sock.settimeout(self.config.connect_timeout)
-                ret = sock.connect_ex((host, port))
-                elapsed = time.perf_counter() - start
-                result.response_time = elapsed
+        for attempt in range(20):
+            try:
+                with socket.socket(family, socket.SOCK_STREAM) as sock:
+                    sock.settimeout(self.config.connect_timeout)
+                    start = time.perf_counter()
+                    ret = sock.connect_ex((host, port))
+                    result.response_time = time.perf_counter() - start
 
-                if ret == 0:
-                    result.state = PortState.OPEN
-                    if self.config.grab_banners:
-                        result.banner = self._grab_banner(sock, host, port)
-                    if self.config.ssl_probe and port in (443, 8443, 465, 993, 995, 636):
-                        result.ssl_info = self._probe_ssl(host, port)
-                elif ret in (111, 10061):  # connection refused
-                    result.state = PortState.CLOSED
-                else:
-                    result.state = PortState.FILTERED
-        except socket.timeout:
-            result.state = PortState.FILTERED
-        except ConnectionRefusedError:
-            result.state = PortState.CLOSED
-        except OSError:
-            result.state = PortState.FILTERED
+                    if ret in _RESOURCE_ERRORS:
+                        time.sleep(0.05 * (attempt + 1))
+                        continue
+                    if ret == 0:
+                        result.state = PortState.OPEN
+                        if self.config.grab_banners and not (
+                            self.config.ssl_probe and port in TLS_PORTS
+                        ):
+                            result.banner = self._grab_banner(sock, sni or host, port)
+                    elif ret in _REFUSED:
+                        result.state = PortState.CLOSED
+                    else:
+                        result.state = PortState.FILTERED
+                break
+            except socket.timeout:
+                result.state = PortState.FILTERED
+                break
+            except ConnectionRefusedError:
+                result.state = PortState.CLOSED
+                break
+            except OSError as e:
+                if e.errno in _RESOURCE_ERRORS:
+                    time.sleep(0.05 * (attempt + 1))
+                    continue
+                result.state = PortState.FILTERED
+                break
+
+        if result.state == PortState.OPEN and self.config.ssl_probe and port in TLS_PORTS:
+            info, tls_banner = self._tls_probe(host, port, sni, http=port in _HTTPS_PORTS)
+            result.ssl_info = info
+            if self.config.grab_banners:
+                result.banner = tls_banner
 
         if self.config.detect_service and result.state == PortState.OPEN:
-            svc = self.service_db.lookup(port, "tcp")
-            result.service = svc.get("name", "")
-            result.version = self._detect_version(result.banner, svc)
-            result.cpe = svc.get("cpe", "")
+            self._apply_service_info(result, "tcp")
 
         return result
 
     def scan_port_udp(self, host: str, port: int) -> PortResult:
-        """UDP scan with service-specific probes."""
+        """UDP scan with service-specific probes (ICMP unreachable ⇒ closed)."""
         result = PortResult(port=port, state=PortState.OPEN_FILTERED, protocol="udp")
+        probe = self._get_udp_probe(port) if self.config.udp_payload_probes else b""
+        attempts = max(1, self.config.retry_count)
         start = time.perf_counter()
 
-        probe = self._get_udp_probe(port)
         try:
-            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+            with socket.socket(_family_for(host), socket.SOCK_DGRAM) as sock:
                 sock.settimeout(self.config.timeout)
-                sock.sendto(probe, (host, port))
-
-                try:
-                    data, _ = sock.recvfrom(1024)
-                    result.state = PortState.OPEN
-                    result.banner = data[:200].decode("utf-8", errors="replace").strip()
-                    result.response_time = time.perf_counter() - start
-                except socket.timeout:
-                    # No response could mean open|filtered
-                    result.state = PortState.OPEN_FILTERED
-                    result.response_time = time.perf_counter() - start
+                # A connected UDP socket surfaces ICMP port-unreachable as ECONNREFUSED
+                sock.connect((host, port))
+                for _ in range(attempts):
+                    start = time.perf_counter()
+                    try:
+                        sock.send(probe)
+                        data = sock.recv(2048)
+                        result.state = PortState.OPEN
+                        result.banner = data[:200].decode("utf-8", errors="replace").strip()
+                        break
+                    except socket.timeout:
+                        result.state = PortState.OPEN_FILTERED
+                    except ConnectionRefusedError:
+                        result.state = PortState.CLOSED
+                        break
+                result.response_time = time.perf_counter() - start
+        except ConnectionRefusedError:
+            result.state = PortState.CLOSED
+            result.response_time = time.perf_counter() - start
         except OSError as e:
-            if "ICMP" in str(e) or getattr(e, "errno", None) in (111, 10054):
+            if getattr(e, "errno", None) in _REFUSED | {10054}:
                 result.state = PortState.CLOSED
             else:
                 result.state = PortState.OPEN_FILTERED
@@ -305,113 +532,127 @@ class PortScanner:
 
         return result
 
+    def scan_port_raw(self, host: str, port: int) -> PortResult:
+        """Raw-packet scan (SYN / ACK / FIN / XMAS / NULL / Window)."""
+        from core.raw_scan import interpret
+
+        result = PortResult(port=port, state=PortState.FILTERED, protocol="tcp")
+        if self._raw is None:
+            return result
+        reply = self._raw.probe(host, port)
+        result.state = PortState(interpret(self.config.scan_type.value, reply))
+        result.response_time = reply.rtt
+        if reply.ttl:
+            result.extra_info = f"ttl={reply.ttl}"
+
+        if self.config.detect_service and result.state in (PortState.OPEN, PortState.OPEN_FILTERED):
+            svc = self.service_db.lookup(port, "tcp")
+            result.service = svc.get("name", "")
+            result.cpe = svc.get("cpe", "")
+        return result
+
+    def _apply_service_info(self, result: PortResult, proto: str):
+        svc = self.service_db.lookup(result.port, proto)
+        db_name = svc.get("name", "")
+        hint, version = fingerprint.identify(result.banner, result.port)
+        result.service = db_name
+        result.version = version
+        result.cpe = svc.get("cpe", "")
+        if hint and not db_name:
+            result.service = hint
+        elif hint and hint not in db_name and db_name not in hint and hint != "http":
+            # e.g. SSH answering on port 80
+            result.service = hint
+            result.extra_info = f"non-standard port (expected {db_name})"
+
     def _get_udp_probe(self, port: int) -> bytes:
         probes = {
             53: b"\x00\x00\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00"
             b"\x07version\x04bind\x00\x00\x10\x00\x03",  # DNS version
-            161: b"\x30\x26\x02\x01\x00\x04\x06public\xa0\x19\x02\x04\x00"
-            b"\x00\x00\x00\x02\x01\x00\x02\x01\x00\x30\x0b\x30\x09"
-            b"\x06\x05\x2b\x06\x01\x02\x01\x05\x00",  # SNMP
+            69: b"\x00\x01nexscan\x00octet\x00",  # TFTP read request
             123: b"\x1b" + b"\x00" * 47,  # NTP
             137: b"\x00\x01\x00\x00\x00\x01\x00\x00\x00\x00\x00\x00"
             b"\x20CKAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\x00\x00\x21\x00\x01",
+            161: b"\x30\x26\x02\x01\x00\x04\x06public\xa0\x19\x02\x04\x00"
+            b"\x00\x00\x00\x02\x01\x00\x02\x01\x00\x30\x0b\x30\x09"
+            b"\x06\x05\x2b\x06\x01\x02\x01\x05\x00",  # SNMP
             500: b"\x00" * 28,  # IKE
+            1900: b"M-SEARCH * HTTP/1.1\r\nHOST: 239.255.255.250:1900\r\n"
+            b'MAN: "ssdp:discover"\r\nMX: 1\r\nST: ssdp:all\r\n\r\n',  # SSDP
+            5353: b"\x00\x00\x00\x00\x00\x01\x00\x00\x00\x00\x00\x00"
+            b"\x09_services\x07_dns-sd\x04_udp\x05local\x00\x00\x0c\x00\x01",  # mDNS
+            11211: b"\x00\x01\x00\x00\x00\x01\x00\x00stats\r\n",  # memcached
         }
         return probes.get(port, b"\x00\x00")
 
     def _grab_banner(self, sock: socket.socket, host: str, port: int) -> str:
         """Grab service banner with protocol-aware probes."""
+        wait = max(0.1, self.config.max_banner_wait)
+
+        def _recv(timeout: float) -> bytes:
+            sock.settimeout(timeout)
+            try:
+                return sock.recv(4096)
+            except (socket.timeout, OSError):
+                return b""
+
         try:
-            sock.settimeout(self.config.max_banner_wait)
-
-            # Try reading immediately (servers that send banner first)
-            try:
-                r, _, _ = select.select([sock], [], [], 0.5)
-                if r:
-                    data = sock.recv(1024)
-                    if data:
-                        return data.decode("utf-8", errors="replace").strip()[:500]
-            except Exception:
-                pass
-
-            # Send protocol probe
-            probe = self.COMMON_BANNERS.get(port, b"")
-            if probe:
-                probe = probe.replace(b"{host}", host.encode())
-                try:
-                    sock.sendall(probe)
-                    r, _, _ = select.select([sock], [], [], self.config.max_banner_wait)
-                    if r:
-                        data = sock.recv(2048)
-                        return data.decode("utf-8", errors="replace").strip()[:500]
-                except Exception:
-                    pass
-
-            # Generic probe
-            try:
-                sock.sendall(b"\r\n")
-                r, _, _ = select.select([sock], [], [], 0.8)
-                if r:
-                    data = sock.recv(1024)
+            # Servers that talk first (SSH, FTP, SMTP, …)
+            if port not in self._CLIENT_FIRST:
+                data = _recv(min(0.6, wait))
+                if data:
                     return data.decode("utf-8", errors="replace").strip()[:500]
-            except Exception:
-                pass
 
+            probe = self.COMMON_BANNERS.get(port)
+            if probe is None:
+                probe = _HTTP_PROBE if port in _HTTP_PORTS else b"\r\n"
+            sock.sendall(probe.replace(b"{host}", _host_bytes(host)))
+            data = _recv(wait)
+            return data.decode("utf-8", errors="replace").strip()[:500]
         except Exception:
-            pass
-        return ""
+            return ""
 
     def _probe_ssl(self, host: str, port: int) -> Optional[dict]:
         """Retrieve SSL/TLS certificate information."""
+        info, _ = self._tls_probe(host, port, None, http=False)
+        return info
+
+    def _tls_probe(
+        self, host: str, port: int, sni: Optional[str], http: bool
+    ) -> tuple[Optional[dict], str]:
+        """TLS handshake → (cert / cipher info, optional HTTP banner over TLS)."""
         try:
             ctx = ssl.create_default_context()
             ctx.check_hostname = False
             ctx.verify_mode = ssl.CERT_NONE
-            conn = ctx.wrap_socket(
-                socket.create_connection((host, port), timeout=3), server_hostname=host
-            )
-            cert = conn.getpeercert()
-            cipher = conn.cipher()
-            version = conn.version()
-            conn.close()
+            raw = socket.create_connection((host, port), timeout=self.config.connect_timeout)
+            server_name = sni if sni and not _is_ip(sni) else None
+            with ctx.wrap_socket(raw, server_hostname=server_name) as conn:
+                cipher = conn.cipher()
+                info = {
+                    "version": conn.version(),
+                    "cipher": cipher[0] if cipher else "",
+                    "cipher_bits": cipher[2] if cipher else 0,
+                }
+                info.update(fingerprint.decode_der_cert(conn.getpeercert(binary_form=True)))
 
-            info = {
-                "version": version,
-                "cipher": cipher[0] if cipher else "",
-                "cipher_bits": cipher[2] if cipher else 0,
-            }
-            if cert:
-                subject = dict(x[0] for x in cert.get("subject", []))
-                issuer = dict(x[0] for x in cert.get("issuer", []))
-                info.update(
-                    {
-                        "common_name": subject.get("commonName", ""),
-                        "issuer": issuer.get("organizationName", ""),
-                        "not_before": cert.get("notBefore", ""),
-                        "not_after": cert.get("notAfter", ""),
-                        "san": [v for _, v in cert.get("subjectAltName", [])],
-                    }
-                )
-            return info
+                banner = ""
+                if http and self.config.grab_banners:
+                    try:
+                        conn.settimeout(max(0.1, self.config.max_banner_wait))
+                        conn.sendall(_HTTP_PROBE.replace(b"{host}", _host_bytes(sni or host)))
+                        banner = conn.recv(4096).decode("utf-8", errors="replace").strip()[:500]
+                    except (OSError, UnicodeError):
+                        pass
+                return info, banner
         except Exception:
-            return None
+            return None, ""
 
     def _detect_version(self, banner: str, service_info: dict) -> str:
         """Extract version string from banner."""
-        if not banner:
-            return ""
-        import re
+        return fingerprint.identify(banner)[1]
 
-        patterns = [
-            r"(\d+\.\d+\.\d+[-.\w]*)",
-            r"v(\d+\.\d+[-.\w]*)",
-            r"version (\d+\.\d+[-.\w]*)",
-        ]
-        for p in patterns:
-            m = re.search(p, banner, re.IGNORECASE)
-            if m:
-                return m.group(0)
-        return ""
+    # ─────────────────────────── OS GUESS ───────────────────────────
 
     def guess_os(self, ttl: int, open_ports: list) -> tuple[str, int]:
         """Heuristic OS fingerprinting based on TTL and open ports."""
@@ -435,7 +676,7 @@ class PortScanner:
 
         # Port-based hints
         ports_set = set(open_ports)
-        if {135, 139, 445}.issubset(ports_set):
+        if {135, 139, 445}.issubset(ports_set) or 3389 in ports_set:
             os_hints.append("Windows")
             confidence = min(85, confidence + 30)
         if {22, 111}.issubset(ports_set):
@@ -451,104 +692,203 @@ class PortScanner:
         if not os_hints:
             return "Unknown", 0
 
-        # Most common guess
-        from collections import Counter
-
         most_common = Counter(os_hints).most_common(1)[0][0]
         return most_common, confidence
 
-    def scan_target(self, target: str) -> ScanResult:
-        """Full scan of a single target."""
-        import datetime
+    # ─────────────────────────── ORCHESTRATION ───────────────────────────
 
+    def _prepare_host(self, index: int, target: str) -> _HostJob:
+        """Resolve + discover a target. Runs on the discovery pool."""
         result = ScanResult(
             target=target,
             timestamp=datetime.datetime.now().isoformat(),
             scan_type=self.config.scan_type.value,
         )
-
-        # Resolve target
         ip, hostname = self.resolve_target(target)
         result.ip_address = ip
         result.hostname = hostname
+        sni = target if not _is_ip(target) else (hostname or None)
 
-        # Host discovery
-        if self.config.host_discovery:
-            up, ttl = self.check_host_up(ip)
-            result.host_up = up
-            result.ttl = ttl
-            if not up:
-                if self.host_callback:
-                    self.host_callback(result)
-                return result
+        if not _is_ip(ip):
+            result.host_up = False
+            result.extra["error"] = f"Could not resolve {target}"
+        elif self.config.scan_type in RAW_SCAN_TYPES and ":" in ip:
+            result.host_up = False
+            result.extra["error"] = "Raw scans support IPv4 targets only"
+        elif self.config.host_discovery:
+            result.host_up, result.ttl = self.check_host_up(ip)
         else:
             result.host_up = True
-            result.ttl = 64
+            if self.config.detect_os and ":" not in ip:
+                _, result.ttl = self._icmp_ping(ip, min(self.config.host_discovery_timeout, 0.6))
 
-        start_time = time.perf_counter()
+        return _HostJob(index=index, result=result, sni=sni, remaining=len(self.config.ports))
 
-        # Choose scan function
+    def _probe(self, job: _HostJob, port: int) -> Optional[PortResult]:
+        if not self._throttle():
+            return None
+        ip = job.result.ip_address
         if self.config.scan_type == ScanType.UDP:
-            scan_fn = lambda p: self.scan_port_udp(ip, p)
-        else:
-            scan_fn = lambda p: self.scan_port_tcp(ip, p)
+            return self.scan_port_udp(ip, port)
+        if self.config.scan_type in RAW_SCAN_TYPES:
+            return self.scan_port_raw(ip, port)
+        return self.scan_port_tcp(ip, port, sni=job.sni)
 
-        port_results = []
-        total_ports = len(self.config.ports)
-        done = 0
+    def _finalize(self, job: _HostJob):
+        result = job.result
+        result.scan_duration = time.perf_counter() - job.start if job.start else 0.0
+        result.ports = sorted(job.port_results, key=lambda x: x.port)
 
-        with concurrent.futures.ThreadPoolExecutor(max_workers=self.config.threads) as executor:
-            future_to_port = {executor.submit(scan_fn, port): port for port in self.config.ports}
+        if not result.ttl:
+            ttls = [int(p.extra_info[4:]) for p in result.ports if p.extra_info.startswith("ttl=")]
+            if ttls:
+                result.ttl = max(ttls)
 
-            for future in concurrent.futures.as_completed(future_to_port):
-                if self._stop_event.is_set():
-                    executor.shutdown(wait=False, cancel_futures=True)
-                    break
-
-                # Pause support
-                self._pause_event.wait()
-
-                try:
-                    pr = future.result()
-                    port_results.append(pr)
-
-                    if pr.state == PortState.OPEN:
-                        result.open_count += 1
-                    elif pr.state == PortState.FILTERED or pr.state == PortState.OPEN_FILTERED:
-                        result.filtered_count += 1
-                    else:
-                        result.closed_count += 1
-
-                    # Fire callback for open ports immediately
-                    if self.callback and pr.state in (PortState.OPEN, PortState.OPEN_FILTERED):
-                        self.callback(target, pr)
-
-                except Exception as e:
-                    logger.error(f"Port scan error: {e}")
-
-                done += 1
-                with self._lock:
-                    self._completed += 1
-
-                if self.progress_callback:
-                    self.progress_callback(self._completed, self._total, target, done, total_ports)
-
-                # Rate limiting
-                if self.config.rate_limit > 0:
-                    time.sleep(self.config.rate_limit)
-
-        result.scan_duration = time.perf_counter() - start_time
-        result.ports = sorted(port_results, key=lambda x: x.port)
-
-        # OS detection
-        if self.config.detect_os:
-            open_ports = [p.port for p in port_results if p.state == PortState.OPEN]
+        if self.config.detect_os and result.host_up:
+            open_ports = [p.port for p in result.ports if p.state == PortState.OPEN]
             result.os_guess, result.os_confidence = self.guess_os(result.ttl, open_ports)
 
         if self.host_callback:
             self.host_callback(result)
 
-        return result
+    def _record(self, job: _HostJob, pr: PortResult):
+        job.port_results.append(pr)
+        if pr.state == PortState.OPEN:
+            job.result.open_count += 1
+        elif pr.state in (PortState.FILTERED, PortState.OPEN_FILTERED):
+            job.result.filtered_count += 1
+        else:
+            job.result.closed_count += 1
+
+        if self.callback and pr.state in (PortState.OPEN, PortState.OPEN_FILTERED):
+            self.callback(job.result.target, pr)
+
+    def _report_progress(self, target: str, done: int, total: int):
+        if self.progress_callback:
+            self.progress_callback(self._completed, self._total, target, done, total)
+
+    def _discover(self, targets: list[str]) -> list[_HostJob]:
+        """Resolve and discover all targets concurrently, preserving order."""
+        if len(targets) == 1:
+            return [self._prepare_host(0, targets[0])]
+        workers = min(64, len(targets), max(4, self.config.threads // 4))
+        jobs: list[Optional[_HostJob]] = [None] * len(targets)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
+            futs = {ex.submit(self._prepare_host, i, t): i for i, t in enumerate(targets)}
+            for fut in concurrent.futures.as_completed(futs):
+                if self._stop_event.is_set():
+                    ex.shutdown(wait=False, cancel_futures=True)
+                    break
+                try:
+                    jobs[futs[fut]] = fut.result()
+                except Exception as e:
+                    logger.error(f"Discovery error: {e}")
+        return [j for j in jobs if j is not None]
+
+    def _scan_jobs(self, jobs: list[_HostJob]) -> list[ScanResult]:
+        """Scan every (host, port) pair of the given jobs on one shared worker pool."""
+        ports = self.config.ports
+        total_ports = len(ports)
+        up_jobs = []
+
+        for job in jobs:
+            if job.result.host_up:
+                up_jobs.append(job)
+                continue
+            # Down hosts count as done so progress can reach 100%
+            with self._lock:
+                self._completed += total_ports
+            self._report_progress(job.result.target, total_ports, total_ports)
+            if self.host_callback:
+                self.host_callback(job.result)
+
+        work = ((job, port) for job in up_jobs for port in ports)
+        max_inflight = max(1, self.config.threads) * 2
+        inflight: dict[concurrent.futures.Future, _HostJob] = {}
+        started: set[int] = set()
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, self.config.threads)) as ex:
+            while True:
+                while len(inflight) < max_inflight and not self._stop_event.is_set():
+                    item = next(work, None)
+                    if item is None:
+                        break
+                    job, port = item
+                    if job.index not in started:
+                        started.add(job.index)
+                        job.start = time.perf_counter()
+                    inflight[ex.submit(self._probe, job, port)] = job
+
+                if not inflight:
+                    break
+
+                done, _ = concurrent.futures.wait(
+                    inflight, timeout=0.25, return_when=concurrent.futures.FIRST_COMPLETED
+                )
+                for fut in done:
+                    job = inflight.pop(fut)
+                    try:
+                        pr = fut.result()
+                        if pr is not None:
+                            self._record(job, pr)
+                    except Exception as e:
+                        logger.error(f"Port scan error: {e}")
+
+                    job.done += 1
+                    job.remaining -= 1
+                    with self._lock:
+                        self._completed += 1
+                    self._report_progress(job.result.target, job.done, total_ports)
+                    if job.remaining == 0:
+                        self._finalize(job)
+
+                if self._stop_event.is_set():
+                    for fut in inflight:
+                        fut.cancel()
+                    ex.shutdown(wait=True, cancel_futures=True)
+                    for fut, job in inflight.items():
+                        if fut.done() and not fut.cancelled():
+                            try:
+                                pr = fut.result()
+                                if pr is not None:
+                                    self._record(job, pr)
+                            except Exception:
+                                pass
+                    break
+
+        # Hosts interrupted by stop: report partial results
+        for job in up_jobs:
+            if job.index in started and job.remaining > 0:
+                self._finalize(job)
+
+        down = [j for j in jobs if not j.result.host_up]
+        scanned = [j for j in up_jobs if j.index in started]
+        return [j.result for j in sorted(down + scanned, key=lambda j: j.index)]
+
+    def _open_raw_engine(self):
+        if self.config.scan_type in RAW_SCAN_TYPES and self._raw is None:
+            from core.raw_scan import RawScanEngine
+
+            self._raw = RawScanEngine(
+                self.config.scan_type.value,
+                timeout=self.config.timeout,
+                retries=max(1, self.config.retry_count) - 1,
+            )
+
+    def _close_raw_engine(self):
+        if self._raw is not None:
+            self._raw.close()
+            self._raw = None
+
+    def scan_target(self, target: str) -> ScanResult:
+        """Full scan of a single target."""
+        self._open_raw_engine()
+        try:
+            job = self._prepare_host(0, target)
+            results = self._scan_jobs([job])
+        finally:
+            self._close_raw_engine()
+        return results[0] if results else job.result
 
     def run(self) -> list[ScanResult]:
         """Run full scan across all targets."""
@@ -556,45 +896,99 @@ class PortScanner:
         self._completed = 0
         self.results = []
 
-        for target in self.config.targets:
-            if self._stop_event.is_set():
-                break
-            res = self.scan_target(target)
-            self.results.append(res)
+        self._open_raw_engine()
+        try:
+            jobs = self._discover(list(self.config.targets))
+            if not self._stop_event.is_set():
+                self.results = self._scan_jobs(jobs)
+            else:
+                self.results = [j.result for j in jobs]
+        finally:
+            self._close_raw_engine()
 
         return self.results
+
+
+def _host_bytes(host: str) -> bytes:
+    """Encode a host for an HTTP Host header (IDNA for names, ASCII fallback)."""
+    try:
+        return host.encode("idna")
+    except UnicodeError:
+        return host.encode("ascii", errors="ignore")
+
+
+def _is_ip(value: str) -> bool:
+    try:
+        ipaddress.ip_address(value)
+        return True
+    except ValueError:
+        return False
 
 
 def parse_ports(port_str: str) -> list[int]:
     """Parse port string like '22,80,443,1-1024,8080-8090'."""
     ports = set()
-    for part in port_str.split(","):
+    for part in port_str.replace("\n", ",").split(","):
         part = part.strip()
         if "-" in part:
             try:
-                start, end = part.split("-", 1)
-                ports.update(range(int(start), int(end) + 1))
+                start, end = (int(x) for x in part.split("-", 1))
             except ValueError:
-                pass
+                continue
+            lo, hi = min(start, end), max(start, end)
+            ports.update(range(max(1, lo), min(65535, hi) + 1))
         elif part.isdigit():
             ports.add(int(part))
     return sorted(p for p in ports if 1 <= p <= 65535)
 
 
+def _expand_ip_range(part: str) -> Optional[list[str]]:
+    """Expand '10.0.0.1-50' or '10.0.0.1-10.0.0.50'. Returns None if not a range."""
+    left, _, right = part.partition("-")
+    try:
+        start = ipaddress.IPv4Address(left.strip())
+    except ValueError:
+        return None
+    right = right.strip()
+    try:
+        if right.isdigit() and int(right) <= 255:
+            end = ipaddress.IPv4Address(f"{left.rsplit('.', 1)[0]}.{right}")
+        else:
+            end = ipaddress.IPv4Address(right)
+    except ValueError:
+        return None
+    if end < start:
+        start, end = end, start
+    count = int(end) - int(start) + 1
+    if count > MAX_EXPANDED_HOSTS:
+        logger.warning(f"Range {part} has {count} hosts — truncated to {MAX_EXPANDED_HOSTS}")
+        count = MAX_EXPANDED_HOSTS
+    return [str(start + i) for i in range(count)]
+
+
 def parse_targets(target_str: str) -> list[str]:
-    """Parse target string, expanding CIDR ranges."""
-    targets = []
-    for part in target_str.replace("\n", ",").split(","):
+    """Parse target string, expanding CIDR blocks and IP ranges."""
+    targets: list[str] = []
+    for part in target_str.replace("\n", ",").replace(";", ",").split(","):
         part = part.strip()
-        if not part:
+        if not part or part.startswith("#"):
             continue
+
+        if "-" in part and "/" not in part:
+            expanded = _expand_ip_range(part)
+            if expanded is not None:
+                targets.extend(expanded)
+                continue
+
         try:
             net = ipaddress.ip_network(part, strict=False)
-            if net.num_addresses > 256:
-                # Limit to prevent accidental huge scans
-                targets.extend(str(h) for h in list(net.hosts())[:256])
-            else:
-                targets.extend(str(h) for h in net.hosts())
         except ValueError:
             targets.append(part)
+            continue
+
+        hosts = net.hosts()
+        if net.num_addresses > MAX_EXPANDED_HOSTS + 2:
+            # Limit to prevent accidental huge scans (islice keeps /8 or IPv6 /64 cheap)
+            logger.warning(f"{part} truncated to the first {MAX_EXPANDED_HOSTS} hosts")
+        targets.extend(str(h) for h in itertools.islice(hosts, MAX_EXPANDED_HOSTS))
     return list(dict.fromkeys(targets))  # deduplicate preserving order

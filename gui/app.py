@@ -7,15 +7,22 @@ import datetime
 import json
 import os
 import queue
+import re
 import socket
 import sys
 import threading
 import time
 import tkinter as tk
+import webbrowser
 from collections import defaultdict
 from tkinter import filedialog, messagebox, ttk
+from tkinter import font as tkfont
 
-from core.scanner import (
+# Add parent dir to path (before local imports so `python gui/app.py` works)
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from core.scanner import (  # noqa: E402
+    RAW_SCAN_TYPES,
     PortResult,
     PortScanner,
     PortState,
@@ -25,18 +32,8 @@ from core.scanner import (
     parse_ports,
     parse_targets,
 )
-from core.service_db import ServiceDatabase
-from reports.exporter import (
-    export_csv,
-    export_html,
-    export_json,
-    export_txt,
-    export_xml,
-)
-
-# Add parent dir to path
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
+from core.service_db import ServiceDatabase  # noqa: E402
+from reports.exporter import EXPORTERS  # noqa: E402
 
 # ─────────────────────────── COLOR PALETTE ───────────────────────────
 C = {
@@ -71,6 +68,9 @@ C = {
     "tag_open": "#003322",
     "tag_filt": "#332800",
     "tag_closed": "#1a1a2a",
+    "row_even": "#111620",
+    "row_odd": "#0e131c",
+    "disabled": "#2a3348",
 }
 
 FONT_MONO = ("Consolas", 10)
@@ -82,10 +82,93 @@ FONT_UI_BOLD = ("Segoe UI", 10, "bold")
 FONT_UI_SM = ("Segoe UI", 9)
 FONT_TITLE = ("Consolas", 16, "bold")
 FONT_STAT = ("Consolas", 22, "bold")
+FONT_TINY = ("Consolas", 8)
+
+_MONO_CANDIDATES = (
+    "Cascadia Mono",
+    "Consolas",
+    "JetBrains Mono",
+    "SF Mono",
+    "Menlo",
+    "DejaVu Sans Mono",
+    "Liberation Mono",
+    "Courier New",
+)
+_UI_CANDIDATES = ("Segoe UI", "SF Pro Text", "Helvetica Neue", "Inter", "Cantarell", "DejaVu Sans")
+
+# Where the GUI remembers its last-used settings between sessions
+SETTINGS_DIR = os.path.join(
+    os.environ.get("APPDATA")
+    or os.environ.get("XDG_CONFIG_HOME")
+    or os.path.expanduser("~/.config"),
+    "nexscan",
+)
+SETTINGS_FILE = os.path.join(SETTINGS_DIR, "settings.json")
+
+
+def _init_fonts(root: tk.Misc):
+    """Pick installed font families (Consolas / Segoe UI don't exist on Linux/macOS)."""
+    global FONT_MONO, FONT_MONO_SM, FONT_MONO_LG, FONT_MONO_XL, FONT_UI, FONT_UI_BOLD
+    global FONT_UI_SM, FONT_TITLE, FONT_STAT, FONT_TINY
+    try:
+        families = set(tkfont.families(root))
+    except tk.TclError:
+        return
+    mono = next((f for f in _MONO_CANDIDATES if f in families), "TkFixedFont")
+    ui = next((f for f in _UI_CANDIDATES if f in families), "TkDefaultFont")
+    FONT_MONO = (mono, 10)
+    FONT_MONO_SM = (mono, 9)
+    FONT_MONO_LG = (mono, 12)
+    FONT_MONO_XL = (mono, 14)
+    FONT_UI = (ui, 10)
+    FONT_UI_BOLD = (ui, 10, "bold")
+    FONT_UI_SM = (ui, 9)
+    FONT_TITLE = (mono, 16, "bold")
+    FONT_STAT = (mono, 22, "bold")
+    FONT_TINY = (mono, 8)
+
+
+class _FlatButton(tk.Label):
+    """Flat label-based button with hover, disabled state and keyboard-free styling."""
+
+    def __init__(self, parent, text, command, fg, bg, hover_bg, pad):
+        super().__init__(
+            parent,
+            text=text,
+            font=FONT_MONO_SM,
+            bg=bg,
+            fg=fg,
+            cursor="hand2",
+            padx=pad[0],
+            pady=pad[1],
+        )
+        self._command = command
+        self._fg, self._bg, self._hover_bg = fg, bg, hover_bg
+        self._enabled = True
+        self.bind("<Button-1>", self._on_click)
+        self.bind("<Enter>", lambda e: self._enabled and self.configure(bg=self._hover_bg))
+        self.bind("<Leave>", lambda e: self.configure(bg=self._bg))
+
+    def _on_click(self, _event=None):
+        if self._enabled:
+            self._command()
+
+    def set_enabled(self, enabled: bool):
+        self._enabled = enabled
+        self.configure(
+            fg=self._fg if enabled else C["disabled"],
+            cursor="hand2" if enabled else "arrow",
+            bg=self._bg,
+        )
+
+    def set_text(self, text: str, fg: str = ""):
+        if fg:
+            self._fg = fg
+        self.configure(text=text, fg=self._fg if self._enabled else C["disabled"])
 
 
 class NexScanApp(tk.Tk):
-    VERSION = "2.0"
+    VERSION = "3.0"
 
     def __init__(self):
         super().__init__()
@@ -94,13 +177,18 @@ class NexScanApp(tk.Tk):
         self.geometry("1400x900")
         self.minsize(1100, 700)
 
+        # Queue for thread-safe UI updates (created first: widgets may log during build)
+        self._ui_queue: queue.Queue = queue.Queue()
+
+        _init_fonts(self)
         self._setup_style()
         self._init_state()
         self._build_ui()
         self._setup_bindings()
+        self._load_settings()
+        self._count_ports()
+        self._count_targets()
 
-        # Queue for thread-safe UI updates
-        self._ui_queue = queue.Queue()
         self._poll_queue()
 
         self.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -108,6 +196,22 @@ class NexScanApp(tk.Tk):
     def _setup_style(self):
         style = ttk.Style(self)
         style.theme_use("clam")
+
+        # Base defaults so no widget falls back to clam's light bevels
+        style.configure(
+            ".",
+            background=C["surface2"],
+            foreground=C["text"],
+            bordercolor=C["border2"],
+            darkcolor=C["surface2"],
+            lightcolor=C["surface2"],
+            troughcolor=C["bg"],
+            focuscolor=C["accent2"],
+            selectbackground=C["select"],
+            selectforeground=C["white"],
+            insertcolor=C["accent"],
+            font=FONT_MONO_SM,
+        )
 
         # Treeview
         style.configure(
@@ -126,94 +230,163 @@ class NexScanApp(tk.Tk):
             borderwidth=0,
             relief="flat",
             font=FONT_MONO_SM,
+            padding=(6, 5),
         )
         style.map(
             "Treeview",
             background=[("selected", C["select"])],
             foreground=[("selected", C["white"])],
         )
-        style.map("Treeview.Heading", background=[("active", C["border"])])
+        style.map(
+            "Treeview.Heading",
+            background=[("active", C["border"])],
+            foreground=[("active", C["white"])],
+        )
+        style.layout("Treeview", [("Treeview.treearea", {"sticky": "nswe"})])
 
-        # Scrollbars
-        style.configure(
-            "Vertical.TScrollbar",
-            background=C["surface2"],
-            troughcolor=C["bg"],
-            borderwidth=0,
-            arrowsize=12,
-            width=10,
-        )
-        style.configure(
-            "Horizontal.TScrollbar",
-            background=C["surface2"],
-            troughcolor=C["bg"],
-            borderwidth=0,
-            arrowsize=12,
-            width=10,
-        )
+        # Scrollbars — slim, borderless, highlight on hover
+        for orient in ("Vertical", "Horizontal"):
+            style.configure(
+                f"{orient}.TScrollbar",
+                background=C["border2"],
+                troughcolor=C["bg"],
+                bordercolor=C["bg"],
+                darkcolor=C["border2"],
+                lightcolor=C["border2"],
+                arrowcolor=C["text3"],
+                borderwidth=0,
+                arrowsize=10,
+                width=10,
+                gripcount=0,
+            )
+            style.map(
+                f"{orient}.TScrollbar",
+                background=[("active", C["accent2"]), ("pressed", C["accent"])],
+                arrowcolor=[("active", C["accent"])],
+            )
 
         # Progressbar
         style.configure(
             "Scan.Horizontal.TProgressbar",
             background=C["accent"],
             troughcolor=C["surface2"],
+            bordercolor=C["surface2"],
+            darkcolor=C["accent"],
+            lightcolor=C["accent"],
             borderwidth=0,
-            thickness=6,
+            thickness=8,
         )
 
         # Notebook tabs
-        style.configure("TNotebook", background=C["bg"], borderwidth=0)
+        style.configure("TNotebook", background=C["bg"], borderwidth=0, tabmargins=(0, 4, 0, 0))
         style.configure(
             "TNotebook.Tab",
             background=C["surface2"],
             foreground=C["text2"],
-            padding=[14, 8],
+            padding=[14, 7],
             font=FONT_MONO_SM,
             borderwidth=0,
+            bordercolor=C["bg"],
+            lightcolor=C["surface2"],
         )
         style.map(
             "TNotebook.Tab",
             background=[("selected", C["surface"]), ("active", C["border"])],
             foreground=[("selected", C["accent"]), ("active", C["text"])],
+            lightcolor=[("selected", C["accent"])],
+            expand=[("selected", (0, 2, 0, 0))],
+        )
+        # Settings notebook inside the left panel sits on surface2
+        style.configure("Inner.TNotebook", background=C["surface2"], borderwidth=0)
+        style.configure(
+            "Inner.TNotebook.Tab",
+            background=C["input_bg"],
+            foreground=C["text2"],
+            padding=[10, 5],
+            font=FONT_MONO_SM,
+            borderwidth=0,
+            bordercolor=C["surface2"],
+            lightcolor=C["input_bg"],
+        )
+        style.map(
+            "Inner.TNotebook.Tab",
+            background=[("selected", C["surface2"]), ("active", C["border"])],
+            foreground=[("selected", C["accent"]), ("active", C["text"])],
+            lightcolor=[("selected", C["accent"])],
         )
 
         # Separators
         style.configure("TSeparator", background=C["border"])
 
-        # Combobox
+        # Combobox (+ its popdown listbox, which is a plain Tk widget)
         style.configure(
             "TCombobox",
             fieldbackground=C["input_bg"],
-            background=C["surface2"],
+            background=C["btn_bg"],
             foreground=C["text"],
-            selectbackground=C["select"],
+            selectbackground=C["input_bg"],
+            selectforeground=C["text"],
             bordercolor=C["border2"],
+            darkcolor=C["input_bg"],
+            lightcolor=C["input_bg"],
+            arrowcolor=C["accent"],
             arrowsize=12,
+            padding=(4, 2),
         )
         style.map(
             "TCombobox",
             fieldbackground=[("readonly", C["input_bg"])],
             foreground=[("readonly", C["text"])],
+            background=[("active", C["btn_hover"]), ("readonly", C["btn_bg"])],
+            bordercolor=[("focus", C["accent2"])],
         )
+        self.option_add("*TCombobox*Listbox.background", C["surface2"])
+        self.option_add("*TCombobox*Listbox.foreground", C["text"])
+        self.option_add("*TCombobox*Listbox.selectBackground", C["select"])
+        self.option_add("*TCombobox*Listbox.selectForeground", C["white"])
+        self.option_add("*TCombobox*Listbox.font", FONT_MONO_SM)
+        self.option_add("*TCombobox*Listbox.borderWidth", 0)
 
         # Spinbox
         style.configure(
             "TSpinbox",
             fieldbackground=C["input_bg"],
-            background=C["surface2"],
+            background=C["btn_bg"],
             foreground=C["text"],
             bordercolor=C["border2"],
+            darkcolor=C["input_bg"],
+            lightcolor=C["input_bg"],
+            arrowcolor=C["accent"],
+            arrowsize=10,
+            padding=(4, 1),
+        )
+        style.map(
+            "TSpinbox",
+            background=[("active", C["btn_hover"])],
+            bordercolor=[("focus", C["accent2"])],
         )
 
         # Checkbutton
         style.configure(
-            "TCheckbutton", background=C["surface2"], foreground=C["text"], focuscolor=C["accent"]
+            "TCheckbutton",
+            background=C["surface2"],
+            foreground=C["text"],
+            focuscolor=C["surface2"],
+            indicatorbackground=C["input_bg"],
+            indicatorforeground=C["accent"],
+            indicatorrelief="flat",
+            indicatormargin=(0, 0, 6, 0),
+            padding=(2, 2),
         )
         style.map(
             "TCheckbutton",
             background=[("active", C["surface2"])],
-            foreground=[("active", C["white"])],
+            foreground=[("active", C["white"]), ("disabled", C["text3"])],
+            indicatorbackground=[("selected", C["accent_dim"]), ("active", C["btn_hover"])],
         )
+        # Variant for toolbars on the darker surface colour
+        style.configure("Bar.TCheckbutton", background=C["surface"])
+        style.map("Bar.TCheckbutton", background=[("active", C["surface"])])
 
         # Labelframe
         style.configure(
@@ -240,6 +413,18 @@ class NexScanApp(tk.Tk):
         self.is_paused = False
         self.scan_start_time = None
         self.filtered_results = []
+        self._paused_total = 0.0
+        self._pause_started = None
+
+        # Live row store: (target, proto, port) -> (target, PortResult). Filled while the
+        # scan runs so filtering / sorting works before the scan completes.
+        self._rows: dict = {}
+        self._live_counts: dict = {}  # target -> {"open": n, "filtered": n}
+        self._header_sort = None  # (column, descending) when sorted via a heading click
+        self._refresh_job = None
+        self._row_counter = 0
+        self._vuln_busy = False
+        self._raw_ok, self._raw_reason = self._detect_raw_support()
 
         # Live scan stats
         self.stat_open = tk.IntVar(value=0)
@@ -268,14 +453,37 @@ class NexScanApp(tk.Tk):
         self.var_filter_text = tk.StringVar()
         self.var_filter_text.trace_add("write", self._apply_filter)
         self.var_filter_regex = tk.BooleanVar(value=False)
+        self.var_filter_regex.trace_add("write", self._apply_filter)
+        self.var_show_closed.trace_add("write", self._apply_filter)
+        self.var_show_filtered.trace_add("write", self._apply_filter)
+
+        # Advanced settings (created here so profiles / settings can always reach them)
+        self.var_jitter = tk.DoubleVar(value=0.0)
+        self.var_max_banner = tk.DoubleVar(value=2.0)
+        self.var_udp_probes = tk.BooleanVar(value=True)
+        self.var_quick_resolve = tk.BooleanVar(value=True)
+
+        # History
+        self.var_db_path = tk.StringVar(value=os.path.abspath("nexscan_history.db"))
+        self.var_autosave = tk.BooleanVar(value=False)
+
+    @staticmethod
+    def _detect_raw_support() -> tuple[bool, str]:
+        try:
+            from core.raw_scan import raw_scans_available
+
+            return raw_scans_available()
+        except Exception as e:
+            return False, str(e)
 
     def _build_ui(self):
         # ── Top bar ──
         self._build_topbar()
+        # ── Status bar (packed before the expanding main area so it keeps its space) ──
+        self._build_statusbar()
         # ── Main paned layout ──
         self._build_main()
-        # ── Status bar ──
-        self._build_statusbar()
+        self._update_controls()
 
     def _build_topbar(self):
         bar = tk.Frame(self, bg=C["header_bg"], height=52)
@@ -295,28 +503,29 @@ class NexScanApp(tk.Tk):
         sep = tk.Frame(bar, bg=C["border"], width=1)
         sep.pack(side="left", fill="y", padx=20, pady=10)
 
-        # Quick action buttons
-        for text, cmd, fg in [
-            ("▶  START SCAN", self._start_scan, C["green"]),
-            ("⏸  PAUSE", self._toggle_pause, C["yellow"]),
-            ("■  STOP", self._stop_scan, C["red"]),
-            ("⟳  CLEAR", self._clear_results, C["text2"]),
-        ]:
-            btn = self._make_button(
-                bar, text, cmd, fg=fg, bg=C["btn_bg"], hover_bg=C["btn_hover"], pad=(14, 6)
-            )
+        # Quick action buttons (kept so their state can follow the scan)
+        self.btn_start = self._make_button(
+            bar, "▶  START SCAN", self._start_scan, fg=C["green"], pad=(14, 6)
+        )
+        self.btn_pause = self._make_button(
+            bar, "⏸  PAUSE", self._toggle_pause, fg=C["yellow"], pad=(14, 6)
+        )
+        self.btn_stop = self._make_button(bar, "■  STOP", self._stop_scan, fg=C["red"], pad=(14, 6))
+        self.btn_clear = self._make_button(
+            bar, "⟳  CLEAR", self._clear_results, fg=C["text2"], pad=(14, 6)
+        )
+        for btn in (self.btn_start, self.btn_pause, self.btn_stop, self.btn_clear):
             btn.pack(side="left", padx=4, pady=10)
 
         # Right side: export + settings
         tk.Frame(bar, bg=C["header_bg"]).pack(side="left", fill="x", expand=True)
 
         for text, cmd, fg in [
-            ("⬇  EXPORT", self._export_menu, C["purple"]),
             ("✦  ABOUT", self._show_about, C["text2"]),
+            ("⬇  EXPORT", self._export_menu, C["purple"]),
+            ("◷  HISTORY", lambda: self._select_tab(self.tab_history), C["accent"]),
         ]:
-            btn = self._make_button(
-                bar, text, cmd, fg=fg, bg=C["btn_bg"], hover_bg=C["btn_hover"], pad=(14, 6)
-            )
+            btn = self._make_button(bar, text, cmd, fg=fg, pad=(14, 6))
             btn.pack(side="right", padx=4, pady=10)
 
         # Scan elapsed timer label
@@ -328,6 +537,24 @@ class NexScanApp(tk.Tk):
             bar, text="⏱", font=FONT_MONO_SM, bg=C["header_bg"], fg=C["text3"]
         )
         self.lbl_timer_icon.pack(side="right")
+
+    def _select_tab(self, tab):
+        try:
+            self.notebook.select(tab)
+        except (tk.TclError, AttributeError):
+            pass
+
+    def _update_controls(self):
+        """Sync toolbar buttons with the scan state."""
+        scanning = self.is_scanning
+        self.btn_start.set_enabled(not scanning)
+        self.btn_pause.set_enabled(scanning)
+        self.btn_stop.set_enabled(scanning)
+        self.btn_clear.set_enabled(not scanning)
+        if self.is_paused:
+            self.btn_pause.set_text("▶  RESUME", fg=C["green"])
+        else:
+            self.btn_pause.set_text("⏸  PAUSE", fg=C["yellow"])
 
     def _build_main(self):
         main = tk.PanedWindow(
@@ -344,7 +571,19 @@ class NexScanApp(tk.Tk):
         main.add(right, minsize=600)
 
     def _build_left_panel(self, parent):
-        frame = tk.Frame(parent, bg=C["surface"])
+        # Scrollable container: the settings column is taller than small screens
+        outer = tk.Frame(parent, bg=C["surface"])
+        canvas = tk.Canvas(outer, bg=C["surface"], highlightthickness=0, bd=0)
+        vsb = ttk.Scrollbar(outer, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=vsb.set)
+        vsb.pack(side="right", fill="y")
+        canvas.pack(side="left", fill="both", expand=True)
+
+        frame = tk.Frame(canvas, bg=C["surface"])
+        win = canvas.create_window((0, 0), window=frame, anchor="nw")
+        frame.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.bind("<Configure>", lambda e: canvas.itemconfigure(win, width=e.width))
+        self._bind_mousewheel(outer, canvas)
 
         # ── Target input ──
         sec = self._section(frame, "TARGET")
@@ -367,16 +606,19 @@ class NexScanApp(tk.Tk):
         self.txt_targets.insert("1.0", "192.168.1.1")
         self.txt_targets.pack(fill="x", padx=8, pady=(0, 6))
 
-        hint = tk.Label(
+        self.txt_targets.bind("<KeyRelease>", lambda e: self._count_targets())
+
+        self.lbl_target_summary = tk.Label(
             sec,
-            text="Single IP, range (192.168.1.1-50), CIDR, or hostname. One per line or comma-separated.",
+            text="IP, range (192.168.1.1-50), CIDR, or hostname — one per line or comma-separated",
             bg=C["surface2"],
             fg=C["text3"],
-            font=("Consolas", 8),
+            font=FONT_TINY,
             wraplength=300,
             justify="left",
+            anchor="w",
         )
-        hint.pack(fill="x", padx=8, pady=(0, 6))
+        self.lbl_target_summary.pack(fill="x", padx=8, pady=(0, 6))
 
         # ── Port config ──
         sec2 = self._section(frame, "PORTS")
@@ -434,15 +676,17 @@ class NexScanApp(tk.Tk):
             "21,22,23,25,53,80,110,135,139,143,443,445,993,995,1433,1521,3306,3389,5432,5900,8080,8443,27017",
         )
         self.txt_ports.pack(fill="x", padx=8, pady=(2, 6))
+        self.txt_ports.bind("<KeyRelease>", lambda e: self._count_ports())
 
-        phint = tk.Label(
+        self.lbl_port_summary = tk.Label(
             sec2,
             text="e.g.: 22,80,443  or  1-1024  or  80,443,8000-9000",
             bg=C["surface2"],
             fg=C["text3"],
-            font=("Consolas", 8),
+            font=FONT_TINY,
+            anchor="w",
         )
-        phint.pack(anchor="w", padx=8, pady=(0, 6))
+        self.lbl_port_summary.pack(fill="x", padx=8, pady=(0, 6))
 
         # ── Scan Type ──
         sec3 = self._section(frame, "SCAN TYPE")
@@ -456,43 +700,113 @@ class NexScanApp(tk.Tk):
             "NULL*",
             "Window*",
         ]
+        grid = tk.Frame(sec3, bg=C["surface2"])
+        grid.pack(fill="x", padx=6, pady=(2, 0))
         for i, st in enumerate(scan_types):
             needs_root = st.endswith("*")
-            fg = C["text2"] if needs_root else C["text"]
+            usable = self._raw_ok or not needs_root
             rb = tk.Radiobutton(
-                sec3,
+                grid,
                 text=st,
                 variable=self.var_scan_type,
                 value=st,
                 bg=C["surface2"],
-                fg=fg,
-                selectcolor=C["accent_dim"],
+                fg=C["text"] if not needs_root else C["text2"],
+                disabledforeground=C["disabled"],
+                selectcolor=C["input_bg"],
                 activebackground=C["surface2"],
                 activeforeground=C["white"],
                 font=FONT_MONO_SM,
-                cursor="hand2" if not needs_root else "arrow",
+                cursor="hand2" if usable else "arrow",
                 indicatoron=True,
+                highlightthickness=0,
+                bd=0,
+                state="normal" if usable else "disabled",
             )
-            rb.pack(anchor="w", padx=8, pady=1)
+            rb.grid(row=i // 2, column=i % 2, sticky="w", padx=4, pady=2)
+        grid.columnconfigure(0, weight=1)
+        grid.columnconfigure(1, weight=1)
 
+        self.lbl_scan_hint = tk.Label(
+            sec3,
+            text="",
+            bg=C["surface2"],
+            fg=C["text2"],
+            font=FONT_TINY,
+            wraplength=300,
+            justify="left",
+            anchor="w",
+        )
+        self.lbl_scan_hint.pack(fill="x", padx=8, pady=(4, 0))
+        root_note = (
+            "* Raw packet scans — privileges OK"
+            if self._raw_ok
+            else f"* Unavailable: {self._raw_reason}"
+        )
         tk.Label(
             sec3,
-            text="* Requires root/admin privileges",
+            text=root_note,
             bg=C["surface2"],
-            fg=C["text3"],
-            font=("Consolas", 8),
+            fg=C["green"] if self._raw_ok else C["text3"],
+            font=FONT_TINY,
+            wraplength=300,
+            justify="left",
         ).pack(anchor="w", padx=8, pady=(2, 6))
+        self.var_scan_type.trace_add("write", lambda *a: self._update_scan_type_hint())
+        self._update_scan_type_hint()
 
         # ── Settings tabs ──
         sec4 = self._section(frame, "SETTINGS")
-        nb = ttk.Notebook(sec4)
+        nb = ttk.Notebook(sec4, style="Inner.TNotebook")
         nb.pack(fill="both", expand=True, padx=6, pady=4)
 
         self._build_perf_tab(nb)
         self._build_output_tab(nb)
         self._build_advanced_tab(nb)
 
-        return frame
+        return outer
+
+    _SCAN_TYPE_HINTS = {
+        "TCP Connect": "Full 3-way handshake. Works unprivileged; enables banners & TLS info.",
+        "UDP": "Service-specific payloads. Silence = open|filtered, ICMP unreachable = closed.",
+        "SYN Stealth*": "Half-open SYN probe: SYN/ACK = open, RST = closed. Fast and quiet.",
+        "ACK*": "Maps firewall rules: RST = unfiltered, no reply = filtered.",
+        "FIN*": "FIN probe slips past some stateless filters. RST = closed.",
+        "XMAS*": "FIN+PSH+URG probe. RST = closed, silence = open|filtered.",
+        "NULL*": "No flags set. RST = closed, silence = open|filtered.",
+        "Window*": "ACK probe reading the RST window size (open on some BSD-derived stacks).",
+    }
+
+    def _update_scan_type_hint(self):
+        if hasattr(self, "lbl_scan_hint"):
+            self.lbl_scan_hint.configure(
+                text=self._SCAN_TYPE_HINTS.get(self.var_scan_type.get(), "")
+            )
+
+    def _bind_mousewheel(self, area: tk.Widget, canvas: tk.Canvas):
+        """Scroll *canvas* with the wheel while the pointer is over *area*."""
+
+        def _on_wheel(event):
+            if getattr(event, "num", 0) == 4:
+                delta = -1
+            elif getattr(event, "num", 0) == 5:
+                delta = 1
+            else:
+                delta = -1 if event.delta > 0 else 1
+            canvas.yview_scroll(delta * 2, "units")
+
+        def _bind(_e):
+            canvas.bind_all("<MouseWheel>", _on_wheel)
+            canvas.bind_all("<Button-4>", _on_wheel)
+            canvas.bind_all("<Button-5>", _on_wheel)
+
+        def _unbind(_e):
+            canvas.unbind_all("<MouseWheel>")
+            canvas.unbind_all("<Button-4>")
+            canvas.unbind_all("<Button-5>")
+
+        area.bind("<Enter>", _bind)
+        area.bind("<Leave>", _unbind)
 
     def _build_perf_tab(self, notebook):
         tab = tk.Frame(notebook, bg=C["surface2"])
@@ -500,10 +814,10 @@ class NexScanApp(tk.Tk):
 
         items = [
             ("Threads", self.var_threads, 1, 1000, ""),
-            ("Timeout (s)", self.var_timeout, 0.1, 30.0, ""),
-            ("Connect Timeout (s)", self.var_connect_timeout, 0.5, 60.0, ""),
-            ("Rate Limit (ms)", self.var_rate_limit, 0.0, 5000.0, "0 = unlimited"),
-            ("Retries", self.var_retry, 0, 5, ""),
+            ("Reply Timeout (s)", self.var_timeout, 0.1, 30.0, "UDP/raw"),
+            ("Connect Timeout (s)", self.var_connect_timeout, 0.5, 60.0, "TCP"),
+            ("Rate Limit (ms)", self.var_rate_limit, 0.0, 5000.0, "0=off"),
+            ("Probe Attempts", self.var_retry, 1, 5, "UDP/raw"),
         ]
         for label, var, mn, mx, hint in items:
             row = tk.Frame(tab, bg=C["surface2"])
@@ -514,7 +828,7 @@ class NexScanApp(tk.Tk):
                 bg=C["surface2"],
                 fg=C["text2"],
                 font=FONT_MONO_SM,
-                width=20,
+                width=19,
                 anchor="w",
             ).pack(side="left")
             is_int = isinstance(var, tk.IntVar)
@@ -524,9 +838,9 @@ class NexScanApp(tk.Tk):
             )
             sp.pack(side="left", padx=4)
             if hint:
-                tk.Label(
-                    row, text=hint, bg=C["surface2"], fg=C["text3"], font=("Consolas", 8)
-                ).pack(side="left")
+                tk.Label(row, text=hint, bg=C["surface2"], fg=C["text3"], font=FONT_TINY).pack(
+                    side="left"
+                )
 
     def _build_output_tab(self, notebook):
         tab = tk.Frame(notebook, bg=C["surface2"])
@@ -553,7 +867,6 @@ class NexScanApp(tk.Tk):
         # Jitter
         jrow = tk.Frame(tab, bg=C["surface2"])
         jrow.pack(fill="x", padx=8, pady=3)
-        self.var_jitter = tk.DoubleVar(value=0.0)
         tk.Label(
             jrow,
             text="Jitter (ms)",
@@ -576,7 +889,6 @@ class NexScanApp(tk.Tk):
         # Max banner wait
         brow = tk.Frame(tab, bg=C["surface2"])
         brow.pack(fill="x", padx=8, pady=3)
-        self.var_max_banner = tk.DoubleVar(value=2.0)
         tk.Label(
             brow,
             text="Banner Wait (s)",
@@ -597,13 +909,11 @@ class NexScanApp(tk.Tk):
         ).pack(side="left", padx=4)
 
         # UDP probes
-        self.var_udp_probes = tk.BooleanVar(value=True)
         ttk.Checkbutton(tab, text="UDP Service Probes", variable=self.var_udp_probes).pack(
             anchor="w", padx=10, pady=3
         )
 
         # Quick resolve
-        self.var_quick_resolve = tk.BooleanVar(value=True)
         ttk.Checkbutton(tab, text="DNS Reverse Lookup", variable=self.var_quick_resolve).pack(
             anchor="w", padx=10, pady=3
         )
@@ -695,16 +1005,22 @@ class NexScanApp(tk.Tk):
             width=10,
         )
         self.lbl_eta.pack(side="left")
+        self.lbl_rate = tk.Label(
+            eta_col, text="", bg=C["bg"], fg=C["text3"], font=FONT_MONO_SM, width=12, anchor="e"
+        )
+        self.lbl_rate.pack(side="left")
 
-        # ── Notebook: Results / Log / SSL / OS ──
+        # ── Notebook: Results / Log / Detail / Stats / Vulns / History ──
         nb = ttk.Notebook(frame)
         nb.pack(fill="both", expand=True, padx=8, pady=(0, 4))
+        self.notebook = nb
 
         self._build_results_tab(nb)
         self._build_log_tab(nb)
         self._build_detail_tab(nb)
         self._build_compare_tab(nb)
         self._build_vuln_tab(nb)
+        self._build_history_tab(nb)
 
         return frame
 
@@ -726,9 +1042,10 @@ class NexScanApp(tk.Tk):
 
             inner = tk.Frame(col, bg=C["surface2"])
             inner.pack(fill="both", expand=True, padx=2, pady=4)
+            tk.Frame(inner, bg=color, height=2).pack(fill="x", side="top")
 
             val_lbl = tk.Label(inner, textvariable=var, font=FONT_STAT, bg=C["surface2"], fg=color)
-            val_lbl.pack(pady=(8, 0))
+            val_lbl.pack(pady=(6, 0))
             tk.Label(inner, text=label, font=FONT_MONO_SM, bg=C["surface2"], fg=C["text3"]).pack()
 
         # Separator + scan info
@@ -739,9 +1056,11 @@ class NexScanApp(tk.Tk):
         info_col.pack(side="left", fill="both", expand=True, padx=2)
         inner2 = tk.Frame(info_col, bg=C["surface2"])
         inner2.pack(fill="both", expand=True, padx=2, pady=4)
+        self.status_strip = tk.Frame(inner2, bg=C["text3"], height=2)
+        self.status_strip.pack(fill="x", side="top")
 
         tk.Label(inner2, text="STATUS", font=FONT_MONO_SM, bg=C["surface2"], fg=C["text3"]).pack(
-            pady=(8, 0)
+            pady=(6, 0)
         )
         self.lbl_status = tk.Label(
             inner2, text="IDLE", font=FONT_MONO_LG, bg=C["surface2"], fg=C["text2"]
@@ -779,9 +1098,9 @@ class NexScanApp(tk.Tk):
         )
         self.entry_filter.pack(side="left", padx=4, ipady=4)
 
-        ttk.Checkbutton(fbar, text="Regex", variable=self.var_filter_regex).pack(
-            side="left", padx=2
-        )
+        ttk.Checkbutton(
+            fbar, text="Regex", variable=self.var_filter_regex, style="Bar.TCheckbutton"
+        ).pack(side="left", padx=2)
 
         # Sort controls
         tk.Label(fbar, text="Sort:", bg=C["surface"], fg=C["text2"], font=FONT_MONO_SM).pack(
@@ -798,7 +1117,7 @@ class NexScanApp(tk.Tk):
             font=FONT_MONO_SM,
         )
         sort_cb.pack(side="left", padx=4)
-        sort_cb.bind("<<ComboboxSelected>>", lambda e: self._refresh_results_view())
+        sort_cb.bind("<<ComboboxSelected>>", self._on_sort_preset)
 
         # Host filter
         tk.Label(fbar, text="Host:", bg=C["surface"], fg=C["text2"], font=FONT_MONO_SM).pack(
@@ -831,10 +1150,12 @@ class NexScanApp(tk.Tk):
         tree_frame.pack(fill="both", expand=True, padx=4, pady=(0, 4))
 
         self.tree = ttk.Treeview(tree_frame, columns=cols, show="headings", selectmode="extended")
+        self._col_labels = dict(zip(cols, col_labels))
 
         for col, lbl, w in zip(cols, col_labels, col_widths):
             self.tree.heading(col, text=lbl, command=lambda c=col: self._sort_tree(c))
-            self.tree.column(col, width=w, minwidth=40, anchor="w")
+            anchor = "center" if col in ("port", "proto", "rtt") else "w"
+            self.tree.column(col, width=w, minwidth=40, anchor=anchor, stretch=col == "banner")
 
         # Scrollbars
         vsb = ttk.Scrollbar(tree_frame, orient="vertical", command=self.tree.yview)
@@ -845,15 +1166,32 @@ class NexScanApp(tk.Tk):
         hsb.pack(side="bottom", fill="x")
         self.tree.pack(fill="both", expand=True)
 
-        # Row tags
-        self.tree.tag_configure("open", background=C["tag_open"], foreground=C["green"])
-        self.tree.tag_configure("filtered", background=C["tag_filt"], foreground=C["yellow"])
-        self.tree.tag_configure("closed", background=C["tag_closed"], foreground=C["text3"])
-        self.tree.tag_configure("alt", background=C["row_alt"])
+        # Row tags: state sets the text colour, striping sets the background
+        self.tree.tag_configure("even", background=C["row_even"])
+        self.tree.tag_configure("odd", background=C["row_odd"])
+        self.tree.tag_configure("open", foreground=C["green"])
+        self.tree.tag_configure("filtered", foreground=C["yellow"])
+        self.tree.tag_configure("closed", foreground=C["text3"])
+        self.tree.tag_configure("warn", foreground=C["orange"])
 
-        # Context menu
+        # Empty-state hint (hidden as soon as rows appear)
+        self.lbl_empty = tk.Label(
+            tree_frame,
+            text="No results yet\n\nEnter a target and press F5 to start a scan",
+            bg=C["surface"],
+            fg=C["text3"],
+            font=FONT_MONO,
+            justify="center",
+        )
+        self.lbl_empty.place(relx=0.5, rely=0.45, anchor="center")
+
+        # Context menu (Button-2 is the right button on macOS)
         self.tree.bind("<Button-3>", self._tree_context_menu)
+        if sys.platform == "darwin":
+            self.tree.bind("<Button-2>", self._tree_context_menu)
         self.tree.bind("<Double-Button-1>", self._show_port_detail)
+        self.tree.bind("<Return>", self._show_port_detail)
+        self.tree.bind("<Control-c>", lambda e: self._copy_selected_rows())
 
     def _build_log_tab(self, notebook):
         tab = tk.Frame(notebook, bg=C["bg"])
@@ -877,6 +1215,9 @@ class NexScanApp(tk.Tk):
                 activeforeground=C["white"],
                 font=FONT_MONO_SM,
                 cursor="hand2",
+                highlightthickness=0,
+                bd=0,
+                command=self._rerender_log,
             )
             rb.pack(side="left", padx=8, pady=4)
 
@@ -891,9 +1232,9 @@ class NexScanApp(tk.Tk):
         ).pack(side="right", padx=8)
 
         self.var_autoscroll = tk.BooleanVar(value=True)
-        ttk.Checkbutton(ctrl, text="Auto-scroll", variable=self.var_autoscroll).pack(
-            side="right", padx=4
-        )
+        ttk.Checkbutton(
+            ctrl, text="Auto-scroll", variable=self.var_autoscroll, style="Bar.TCheckbutton"
+        ).pack(side="right", padx=4)
 
         # Log text area
         log_frame = tk.Frame(tab, bg=C["bg"])
@@ -1004,7 +1345,7 @@ class NexScanApp(tk.Tk):
             ("sep", C["border2"]),
         ]:
             self.detail_text.tag_configure(tag, foreground=fg_color)
-        self.detail_text.tag_configure("bold", font=("Consolas", 10, "bold"))
+        self.detail_text.tag_configure("bold", font=(FONT_MONO[0], 10, "bold"))
         self.detail_text.tag_configure("mono_lg", font=FONT_MONO_LG)
 
     def _build_compare_tab(self, notebook):
@@ -1046,29 +1387,32 @@ class NexScanApp(tk.Tk):
         """Tab for CVE/vulnerability info and geolocation."""
         tab = tk.Frame(notebook, bg=C["bg"])
         notebook.add(tab, text="  Vulnerabilities  ")
+        self.tab_vuln = tab
 
         ctrl = tk.Frame(tab, bg=C["surface"])
         ctrl.pack(fill="x", padx=4, pady=(4, 2))
 
-        self._make_button(
-            ctrl,
-            "🔍 Lookup CVEs",
-            self._lookup_cves,
-            fg=C["red"],
-            bg=C["btn_bg"],
-            hover_bg=C["btn_hover"],
-            pad=(8, 3),
-        ).pack(side="left", padx=4)
+        self.btn_cve = self._make_button(
+            ctrl, "🔍 Lookup CVEs", self._lookup_cves, fg=C["red"], pad=(8, 3)
+        )
+        self.btn_cve.pack(side="left", padx=4, pady=4)
+        self.btn_geo = self._make_button(
+            ctrl, "📍 Geolocation + WHOIS", self._lookup_geolocation, fg=C["accent"], pad=(8, 3)
+        )
+        self.btn_geo.pack(side="left", padx=4, pady=4)
 
-        self._make_button(
-            ctrl,
-            "📍 Lookup Geolocation",
-            self._lookup_geolocation,
-            fg=C["accent"],
-            bg=C["btn_bg"],
-            hover_bg=C["btn_hover"],
-            pad=(8, 3),
-        ).pack(side="left", padx=4)
+        self.lbl_vuln_status = tk.Label(
+            ctrl, text="", bg=C["surface"], fg=C["text3"], font=FONT_MONO_SM
+        )
+        self.lbl_vuln_status.pack(side="left", padx=12)
+        key_note = (
+            "NVD API key: set"
+            if os.environ.get("NVD_API_KEY")
+            else "Tip: set NVD_API_KEY for 10× faster lookups"
+        )
+        tk.Label(ctrl, text=key_note, bg=C["surface"], fg=C["text3"], font=FONT_TINY).pack(
+            side="right", padx=8
+        )
 
         # Vulnerability text area
         vuln_frame = tk.Frame(tab, bg=C["bg"])
@@ -1087,14 +1431,13 @@ class NexScanApp(tk.Tk):
             highlightbackground=C["border"],
             padx=12,
             pady=8,
+            cursor="arrow",
         )
 
         vuln_vsb = ttk.Scrollbar(vuln_frame, orient="vertical", command=self.vuln_text.yview)
-        vuln_hsb = ttk.Scrollbar(vuln_frame, orient="horizontal", command=self.vuln_text.xview)
-        self.vuln_text.configure(yscrollcommand=vuln_vsb.set, xscrollcommand=vuln_hsb.set)
+        self.vuln_text.configure(yscrollcommand=vuln_vsb.set)
 
         vuln_vsb.pack(side="right", fill="y")
-        vuln_hsb.pack(side="bottom", fill="x")
         self.vuln_text.pack(fill="both", expand=True)
 
         # Tags
@@ -1105,90 +1448,418 @@ class NexScanApp(tk.Tk):
             ("cve_low", C["green"]),
             ("header", C["accent"]),
             ("geo_info", C["accent2"]),
+            ("muted", C["text3"]),
+            ("link", C["accent"]),
         ]:
             self.vuln_text.tag_configure(tag, foreground=fg_c)
+        self.vuln_text.tag_configure("link", underline=True)
+        self.vuln_text.tag_bind(
+            "link", "<Enter>", lambda e: self.vuln_text.configure(cursor="hand2")
+        )
+        self.vuln_text.tag_bind(
+            "link", "<Leave>", lambda e: self.vuln_text.configure(cursor="arrow")
+        )
+        self.vuln_text.tag_bind("link", "<Button-1>", self._open_link_under_cursor)
+        self._vuln_write(
+            "Run a scan, then look up known CVEs for fingerprinted services or\n"
+            "geolocate public hosts. Lookups run in the background.\n",
+            "muted",
+            clear=True,
+        )
+
+    def _build_history_tab(self, notebook):
+        """Saved scan runs (SQLite) with load / compare / delete."""
+        tab = tk.Frame(notebook, bg=C["bg"])
+        notebook.add(tab, text="  History  ")
+        self.tab_history = tab
+
+        ctrl = tk.Frame(tab, bg=C["surface"])
+        ctrl.pack(fill="x", padx=4, pady=(4, 2))
+        for text, cmd, fg in [
+            ("⟳ Refresh", self._refresh_history, C["text2"]),
+            ("💾 Save Current", self._save_current_to_history, C["green"]),
+            ("📂 Load", self._load_history_run, C["accent"]),
+            ("⇄ Diff vs Current", self._diff_history_vs_current, C["purple"]),
+            ("⇄ Diff Selected", self._diff_history_selected, C["purple"]),
+            ("✗ Delete", self._delete_history_run, C["red"]),
+        ]:
+            self._make_button(ctrl, text, cmd, fg=fg, pad=(8, 3)).pack(side="left", padx=3, pady=4)
+
+        ttk.Checkbutton(
+            ctrl,
+            text="Auto-save each scan",
+            variable=self.var_autosave,
+            style="Bar.TCheckbutton",
+        ).pack(side="right", padx=8)
+
+        path_row = tk.Frame(tab, bg=C["bg"])
+        path_row.pack(fill="x", padx=6, pady=(2, 4))
+        tk.Label(path_row, text="Database:", bg=C["bg"], fg=C["text3"], font=FONT_MONO_SM).pack(
+            side="left"
+        )
+        tk.Label(
+            path_row, textvariable=self.var_db_path, bg=C["bg"], fg=C["text2"], font=FONT_MONO_SM
+        ).pack(side="left", padx=6)
+        self._make_button(
+            path_row, "Change…", self._choose_db_path, fg=C["accent"], pad=(6, 1)
+        ).pack(side="left", padx=4)
+
+        pw = tk.PanedWindow(tab, orient="vertical", bg=C["border"], sashwidth=4, handlesize=0)
+        pw.pack(fill="both", expand=True, padx=4, pady=(0, 4))
+
+        top = tk.Frame(pw, bg=C["bg"])
+        pw.add(top, minsize=120, height=240)
+        cols = ("id", "time", "type", "hosts", "up", "open", "targets")
+        labels = ("Run", "Timestamp", "Scan Type", "Hosts", "Up", "Open", "Targets")
+        widths = (60, 170, 110, 60, 50, 60, 360)
+        self.history_tree = ttk.Treeview(top, columns=cols, show="headings", selectmode="extended")
+        for col, lbl, w in zip(cols, labels, widths):
+            self.history_tree.heading(col, text=lbl)
+            anchor = "center" if col in ("id", "hosts", "up", "open") else "w"
+            self.history_tree.column(
+                col, width=w, minwidth=40, anchor=anchor, stretch=col == "targets"
+            )
+        self.history_tree.tag_configure("even", background=C["row_even"])
+        self.history_tree.tag_configure("odd", background=C["row_odd"])
+        hvsb = ttk.Scrollbar(top, orient="vertical", command=self.history_tree.yview)
+        self.history_tree.configure(yscrollcommand=hvsb.set)
+        hvsb.pack(side="right", fill="y")
+        self.history_tree.pack(fill="both", expand=True)
+        self.history_tree.bind("<Double-Button-1>", lambda e: self._load_history_run())
+
+        bottom = tk.Frame(pw, bg=C["bg"])
+        pw.add(bottom, minsize=100)
+        self.diff_text = tk.Text(
+            bottom,
+            bg=C["bg"],
+            fg=C["text"],
+            font=FONT_MONO_SM,
+            state="disabled",
+            relief="flat",
+            bd=0,
+            wrap="none",
+            highlightthickness=1,
+            highlightbackground=C["border"],
+            padx=12,
+            pady=8,
+        )
+        dvsb = ttk.Scrollbar(bottom, orient="vertical", command=self.diff_text.yview)
+        self.diff_text.configure(yscrollcommand=dvsb.set)
+        dvsb.pack(side="right", fill="y")
+        self.diff_text.pack(fill="both", expand=True)
+        for tag, fg_c in [
+            ("header", C["accent"]),
+            ("new", C["green"]),
+            ("closed", C["red"]),
+            ("changed", C["yellow"]),
+            ("info", C["purple"]),
+            ("muted", C["text3"]),
+        ]:
+            self.diff_text.tag_configure(tag, foreground=fg_c)
+        self._write_diff("Select a run and choose Diff to see what changed.\n", clear=True)
+
+    # ─────────────────────────── HISTORY ───────────────────────────
+
+    def _choose_db_path(self):
+        path = filedialog.asksaveasfilename(
+            title="Scan history database",
+            defaultextension=".db",
+            initialfile=os.path.basename(self.var_db_path.get()),
+            filetypes=[("SQLite database", "*.db"), ("All Files", "*.*")],
+            confirmoverwrite=False,
+        )
+        if path:
+            self.var_db_path.set(path)
+            self._refresh_history()
+
+    def _refresh_history(self):
+        from core.db import get_timeline_summary
+
+        tree = self.history_tree
+        tree.delete(*tree.get_children())
+        try:
+            rows = get_timeline_summary(self.var_db_path.get(), limit=500)
+        except Exception as e:
+            self._toast(f"Could not read history: {e}", "error")
+            return
+        for i, r in enumerate(rows):
+            targets = ", ".join(r["targets"][:6]) + (" …" if len(r["targets"]) > 6 else "")
+            tree.insert(
+                "",
+                "end",
+                iid=str(r["id"]),
+                values=(
+                    r["id"],
+                    r["timestamp"][:19].replace("T", " "),
+                    r["scan_type"],
+                    r["hosts_scanned"],
+                    r["hosts_up"],
+                    r["total_open_ports"],
+                    targets,
+                ),
+                tags=("even" if i % 2 == 0 else "odd",),
+            )
+
+    def _selected_run_ids(self) -> list[int]:
+        return [int(i) for i in self.history_tree.selection()]
+
+    def _save_current_to_history(self, quiet: bool = False):
+        if not self.scan_results:
+            if not quiet:
+                self._toast("No scan results to save", "warn")
+            return
+        from core.db import save_scan_results
+
+        try:
+            run_id = save_scan_results(self.var_db_path.get(), self.scan_results)
+        except Exception as e:
+            self._toast(f"Saving to history failed: {e}", "error")
+            return
+        self._log(f"Scan saved to history as run #{run_id}", "info")
+        if not quiet:
+            self._toast(f"Saved as run #{run_id}", "ok")
+        self._refresh_history()
+
+    def _load_run(self, run_id: int):
+        from core.db import fetch_run_by_id
+
+        row = fetch_run_by_id(self.var_db_path.get(), run_id)
+        if not row:
+            self._toast(f"Run #{run_id} not found", "error")
+            return None
+        return row
+
+    def _load_history_run(self):
+        if self.is_scanning:
+            self._toast("Stop the scan before loading a saved run", "warn")
+            return
+        ids = self._selected_run_ids()
+        if not ids:
+            self._toast("Select a run first", "warn")
+            return
+        row = self._load_run(ids[0])
+        if not row:
+            return
+        results = [ScanResult.from_dict(d) for d in row[2]]
+        self._clear_results_internal()
+        for res in results:
+            self._ingest_host_result(res)
+        self._recount_stats()
+        self._update_host_list()
+        self._update_stats_tab()
+        self._refresh_results_view()
+        self._set_status(f"RUN #{row[0]}", C["purple"])
+        self._set_current(row[1][:19].replace("T", " "))
+        self._log(f"Loaded run #{row[0]} ({len(results)} host(s)) from history", "info")
+        self._select_tab(self.notebook.tabs()[0])
+
+    def _write_diff(self, text: str, tag=None, clear: bool = False):
+        self.diff_text.configure(state="normal")
+        if clear:
+            self.diff_text.delete("1.0", "end")
+        self.diff_text.insert("end", text, tag)
+        self.diff_text.configure(state="disabled")
+
+    def _show_diff(self, title: str, before, after):
+        from core.compare import compare_scans, generate_diff_report
+
+        report = generate_diff_report(compare_scans(before, after))
+        self._write_diff(f"{title}\n\n", "info", clear=True)
+        for line in report.splitlines():
+            stripped = line.strip()
+            if stripped.startswith("✚"):
+                tag = "new"
+            elif stripped.startswith("✗") or "Status: DOWN" in stripped:
+                tag = "closed"
+            elif stripped.startswith(("⟳", "ⓘ")):
+                tag = "changed"
+            elif stripped.startswith(("Host:", "Changes:", "SCAN")):
+                tag = "header"
+            elif stripped.startswith(("=", "✓")):
+                tag = "muted"
+            else:
+                tag = None
+            self._write_diff(line + "\n", tag)
+
+    def _diff_history_vs_current(self):
+        ids = self._selected_run_ids()
+        if not ids or not self.scan_results:
+            self._toast("Select a run and have current results to compare", "warn")
+            return
+        row = self._load_run(ids[0])
+        if row:
+            self._show_diff(f"Run #{row[0]}  →  current scan", row[2], self.scan_results)
+
+    def _diff_history_selected(self):
+        ids = sorted(self._selected_run_ids())
+        if len(ids) != 2:
+            self._toast("Select exactly two runs (Ctrl+click)", "warn")
+            return
+        old, new = self._load_run(ids[0]), self._load_run(ids[1])
+        if old and new:
+            self._show_diff(f"Run #{old[0]}  →  run #{new[0]}", old[2], new[2])
+
+    def _delete_history_run(self):
+        ids = self._selected_run_ids()
+        if not ids:
+            self._toast("Select run(s) to delete", "warn")
+            return
+        if not messagebox.askyesno(
+            "Delete Runs", f"Permanently delete {len(ids)} run(s) from history?", icon="warning"
+        ):
+            return
+        from core.db import delete_run
+
+        for run_id in ids:
+            delete_run(self.var_db_path.get(), run_id)
+        self._refresh_history()
+        self._toast(f"Deleted {len(ids)} run(s)", "ok")
+
+    def _open_link_under_cursor(self, event):
+        idx = self.vuln_text.index(f"@{event.x},{event.y}")
+        rng = self.vuln_text.tag_prevrange("link", f"{idx}+1c")
+        if rng:
+            url = self.vuln_text.get(*rng).strip()
+            if url.startswith("http"):
+                webbrowser.open(url)
+
+    def _vuln_write(self, text: str, tag=None, clear: bool = False):
+        self.vuln_text.configure(state="normal")
+        if clear:
+            self.vuln_text.delete("1.0", "end")
+        self.vuln_text.insert("end", text, tag)
+        self.vuln_text.configure(state="disabled")
+        self.vuln_text.see("end")
+
+    def _set_vuln_busy(self, busy: bool, status: str = ""):
+        self._vuln_busy = busy
+        self.btn_cve.set_enabled(not busy)
+        self.btn_geo.set_enabled(not busy)
+        self.lbl_vuln_status.configure(text=status, fg=C["accent"] if busy else C["text3"])
 
     def _lookup_cves(self):
-        """Trigger CVE lookup for detected services."""
+        """Look up CVEs for fingerprinted services on a background thread."""
+        if self._vuln_busy:
+            return
         if not self.scan_results:
-            messagebox.showwarning("No Data", "Run a scan first to lookup CVEs")
+            self._toast("Run a scan first to look up CVEs", "warn")
             return
 
-        from core.cve_lookup import format_cve_report, lookup_service_cves
-        from core.scanner import PortState
+        from core.cve_lookup import build_query
 
-        self.vuln_text.configure(state="normal")
-        self.vuln_text.delete("1.0", "end")
-
-        self.vuln_text.insert("end", "CVE VULNERABILITY LOOKUP\n", "header")
-        self.vuln_text.insert("end", "=" * 60 + "\n\n", "header")
-
-        cve_count = 0
+        services: dict = {}
         for result in self.scan_results:
             for port in result.ports:
                 if port.state == PortState.OPEN and port.service:
-                    cves = lookup_service_cves(port.service, port.version, limit=3)
-                    if cves:
-                        cve_count += len(cves)
-                        tag = (
-                            "cve_critical"
-                            if cves[0].severity == "CRITICAL"
-                            else (
-                                "cve_high"
-                                if cves[0].severity == "HIGH"
-                                else "cve_medium" if cves[0].severity == "MEDIUM" else "cve_low"
-                            )
-                        )
-                        self.vuln_text.insert(
-                            "end",
-                            f"\n{result.target}:{port.port}/{port.protocol} — {port.service} {port.version}\n",
-                            "header",
-                        )
-                        report = format_cve_report(port.service, port.version, cves)
-                        self.vuln_text.insert("end", report + "\n\n", tag)
-
-        if cve_count == 0:
-            self.vuln_text.insert(
-                "end", "  ✓ No known CVEs found for detected services\n", "cve_low"
-            )
-        else:
-            self.vuln_text.insert(
-                "end", f"\n{cve_count} CVE(s) found — check details above\n", "header"
-            )
-
-        self.vuln_text.configure(state="disabled")
-
-    def _lookup_geolocation(self):
-        """Lookup geolocation for discovered hosts."""
-        if not self.scan_results:
-            messagebox.showwarning("No Data", "Run a scan first to lookup geolocation")
+                    services.setdefault((port.service, port.version), []).append(
+                        f"{result.target}:{port.port}/{port.protocol}"
+                    )
+        if not services:
+            self._toast("No open services to check", "warn")
             return
 
-        from core.geoloc import format_geolocation_report, lookup_geolocation
+        self._select_tab(self.tab_vuln)
+        self._vuln_write("CVE VULNERABILITY LOOKUP\n", "header", clear=True)
+        self._vuln_write("═" * 64 + "\n", "header")
+        skipped = [(k, v) for k, v in services.items() if not build_query(*k)]
+        todo = [(k, v) for k, v in services.items() if build_query(*k)]
+        for (svc, _ver), where in skipped:
+            self._vuln_write(
+                f"  · {svc:<16} skipped — no version fingerprint ({', '.join(where[:3])})\n",
+                "muted",
+            )
+        if not todo:
+            self._vuln_write("\n  Nothing with a version string to look up.\n", "muted")
+            return
+        self._set_vuln_busy(True, f"Querying NVD… 0/{len(todo)}")
 
-        self.vuln_text.configure(state="normal")
-        self.vuln_text.delete("1.0", "end")
+        def worker():
+            from core.cve_lookup import lookup_service_cves
 
-        self.vuln_text.insert("end", "GEOLOCATION LOOKUP\n", "header")
-        self.vuln_text.insert("end", "=" * 60 + "\n\n", "header")
+            total = 0
+            for i, ((svc, ver), where) in enumerate(todo, 1):
+                cves = lookup_service_cves(svc, ver, limit=5)
+                total += len(cves)
+                self._ui_queue.put(("vuln_cves", svc, ver, where, cves, i, len(todo)))
+            self._ui_queue.put(("vuln_done", f"{total} CVE(s) found", total))
 
-        for result in self.scan_results:
-            if result.host_up:
-                geo = lookup_geolocation(result.ip_address)
-                if geo:
-                    report = format_geolocation_report(geo)
-                    self.vuln_text.insert("end", report + "\n\n", "geo_info")
-                else:
-                    self.vuln_text.insert(
-                        "end", f"  {result.target} ({result.ip_address}) — No info\n\n", "header"
-                    )
+        threading.Thread(target=worker, daemon=True).start()
 
-        self.vuln_text.configure(state="disabled")
+    def _render_cves(self, svc, ver, where, cves, i, n):
+        from core.cve_lookup import severity_rank
+
+        self.lbl_vuln_status.configure(text=f"Querying NVD… {i}/{n}")
+        self._vuln_write(f"\n{svc} {ver}", "header")
+        self._vuln_write(f"   {', '.join(where[:4])}{' …' if len(where) > 4 else ''}\n", "muted")
+        if not cves:
+            self._vuln_write("  ✓ No known CVEs\n", "cve_low")
+            return
+        tags = {4: "cve_critical", 3: "cve_high", 2: "cve_medium", 1: "cve_low"}
+        for cve in cves:
+            tag = tags.get(severity_rank(cve.severity), "muted")
+            self._vuln_write(f"  ● {cve.cve_id:<16} {cve.severity:<8} {cve.score:>4}  ", tag)
+            self._vuln_write(f"{cve.description}\n", None)
+            self._vuln_write("      ")
+            self._vuln_write(cve.url, "link")
+            self._vuln_write("\n")
+
+    def _lookup_geolocation(self):
+        """Lookup geolocation + RDAP/WHOIS for discovered public hosts (background)."""
+        if self._vuln_busy:
+            return
+        if not self.scan_results:
+            self._toast("Run a scan first to look up geolocation", "warn")
+            return
+
+        from core.geoloc import is_public_ip
+
+        hosts = []
+        seen = set()
+        for r in self.scan_results:
+            if r.host_up and r.ip_address not in seen:
+                seen.add(r.ip_address)
+                hosts.append(r)
+
+        self._select_tab(self.tab_vuln)
+        self._vuln_write("GEOLOCATION & WHOIS\n", "header", clear=True)
+        self._vuln_write("═" * 64 + "\n\n", "header")
+        public = [r for r in hosts if is_public_ip(r.ip_address)]
+        for r in hosts:
+            if r not in public:
+                self._vuln_write(
+                    f"  · {r.target} ({r.ip_address}) — private/reserved address, skipped\n",
+                    "muted",
+                )
+        if not public:
+            return
+        self._set_vuln_busy(True, f"Looking up… 0/{len(public)}")
+
+        def worker():
+            from core.geoloc import (
+                format_geolocation_report,
+                lookup_geolocation,
+                lookup_whois_simple,
+            )
+
+            for i, r in enumerate(public, 1):
+                geo = lookup_geolocation(r.ip_address)
+                whois = lookup_whois_simple(r.ip_address) if geo else {}
+                text = (
+                    format_geolocation_report(geo, whois)
+                    if geo
+                    else f"  ✗ {r.target} ({r.ip_address}) — no info"
+                )
+                self._ui_queue.put(("vuln_text", text + "\n\n", "geo_info" if geo else "muted"))
+                self._ui_queue.put(("vuln_status", f"Looking up… {i}/{len(public)}"))
+            self._ui_queue.put(("vuln_done", f"{len(public)} host(s) located", -1))
+
+        threading.Thread(target=worker, daemon=True).start()
 
     def _build_statusbar(self):
         bar = tk.Frame(self, bg=C["header_bg"], height=24)
         bar.pack(fill="x", side="bottom")
         bar.pack_propagate(False)
+        tk.Frame(self, bg=C["border"], height=1).pack(fill="x", side="bottom")
 
         self.lbl_statusbar = tk.Label(
             bar,
@@ -1200,12 +1871,6 @@ class NexScanApp(tk.Tk):
         )
         self.lbl_statusbar.pack(side="left", padx=12)
 
-        # Right side: hostname display
-        self.lbl_hostname = tk.Label(
-            bar, text="", bg=C["header_bg"], fg=C["text3"], font=FONT_MONO_SM
-        )
-        self.lbl_hostname.pack(side="right", padx=12)
-
         tk.Label(
             bar,
             text=f"◈ NexScan v{self.VERSION}",
@@ -1214,72 +1879,163 @@ class NexScanApp(tk.Tk):
             font=FONT_MONO_SM,
         ).pack(side="right", padx=12)
 
+        # Right side: local host + privilege info
+        self.lbl_hostname = tk.Label(
+            bar, text=self._local_host_info(), bg=C["header_bg"], fg=C["text3"], font=FONT_MONO_SM
+        )
+        self.lbl_hostname.pack(side="right", padx=12)
+        tk.Label(
+            bar,
+            text="● raw sockets" if self._raw_ok else "○ unprivileged",
+            bg=C["header_bg"],
+            fg=C["green"] if self._raw_ok else C["text3"],
+            font=FONT_MONO_SM,
+        ).pack(side="right", padx=4)
+
+    @staticmethod
+    def _local_host_info() -> str:
+        name = socket.gethostname()
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+                s.connect(("192.0.2.1", 9))  # no packet is sent for UDP connect
+                ip = s.getsockname()[0]
+        except OSError:
+            ip = "127.0.0.1"
+        return f"local: {name} ({ip})"
+
     # ─────────────────────────── HELPERS ───────────────────────────
 
     def _make_button(self, parent, text, command, fg=None, bg=None, hover_bg=None, pad=(12, 6)):
-        fg = fg or C["text"]
-        bg = bg or C["btn_bg"]
-        hover_bg = hover_bg or C["btn_hover"]
-        btn = tk.Label(
+        return _FlatButton(
             parent,
-            text=text,
-            font=FONT_MONO_SM,
-            bg=bg,
-            fg=fg,
-            cursor="hand2",
-            padx=pad[0],
-            pady=pad[1],
+            text,
+            command,
+            fg=fg or C["text"],
+            bg=bg or C["btn_bg"],
+            hover_bg=hover_bg or C["btn_hover"],
+            pad=pad,
         )
-        btn.bind("<Button-1>", lambda e: command())
-        btn.bind("<Enter>", lambda e: btn.configure(bg=hover_bg))
-        btn.bind("<Leave>", lambda e: btn.configure(bg=bg))
-        return btn
 
     def _section(self, parent, title):
         outer = tk.Frame(parent, bg=C["surface"])
         outer.pack(fill="x", padx=4, pady=3)
 
         # Section header
-        hdr = tk.Frame(outer, bg=C["surface"])
+        hdr = tk.Frame(outer, bg=C["accent_dim"])
         hdr.pack(fill="x")
+        tk.Frame(hdr, bg=C["accent"], width=3).pack(side="left", fill="y")
         tk.Label(
             hdr,
-            text=f"  {title}",
+            text=f" {title}",
             bg=C["accent_dim"],
             fg=C["accent"],
             font=FONT_MONO_SM,
             anchor="w",
             pady=3,
-        ).pack(fill="x")
+        ).pack(fill="x", side="left")
 
         # Content area
         content = tk.Frame(
             outer, bg=C["surface2"], highlightthickness=1, highlightbackground=C["border"]
         )
         content.pack(fill="x", pady=1)
+        tk.Frame(content, bg=C["surface2"], height=4).pack(fill="x")
         return content
 
-    def _log(self, msg: str, tag: str = "info"):
-        def _insert():
-            self.txt_log.configure(state="normal")
-            ts = datetime.datetime.now().strftime("%H:%M:%S")
-            self.txt_log.insert("end", f"[{ts}] ", "timestamp")
-            self.txt_log.insert("end", f"{msg}\n", tag)
-            if self.var_autoscroll.get():
-                self.txt_log.see("end")
-            self.txt_log.configure(state="disabled")
+    _LOG_MAX_LINES = 5000
 
-        self.after(0, _insert)
+    def _log_visible(self, tag: str) -> bool:
+        level = self.var_log_level.get() if hasattr(self, "var_log_level") else "All"
+        if level == "Open":
+            return tag in ("open", "banner", "ssl", "host")
+        if level == "Error":
+            return tag == "error"
+        return True
+
+    def _log(self, msg: str, tag: str = "info"):
+        """Append to the live log. Safe to call from any thread."""
+        if threading.current_thread() is not threading.main_thread():
+            self._ui_queue.put(("log", msg, tag))
+            return
+        ts = datetime.datetime.now().strftime("%H:%M:%S")
+        if not hasattr(self, "_log_entries"):
+            from collections import deque
+
+            self._log_entries = deque(maxlen=self._LOG_MAX_LINES)
+        self._log_entries.append((ts, msg, tag))
+        if self._log_visible(tag):
+            self._insert_log_line(ts, msg, tag)
+
+    def _insert_log_line(self, ts: str, msg: str, tag: str):
+        self.txt_log.configure(state="normal")
+        self.txt_log.insert("end", f"[{ts}] ", "timestamp")
+        self.txt_log.insert("end", f"{msg}\n", tag)
+        lines = int(self.txt_log.index("end-1c").split(".")[0])
+        if lines > self._LOG_MAX_LINES:
+            self.txt_log.delete("1.0", f"{lines - self._LOG_MAX_LINES}.0")
+        if self.var_autoscroll.get():
+            self.txt_log.see("end")
+        self.txt_log.configure(state="disabled")
+
+    def _rerender_log(self):
+        self.txt_log.configure(state="normal")
+        self.txt_log.delete("1.0", "end")
+        self.txt_log.configure(state="disabled")
+        for ts, msg, tag in getattr(self, "_log_entries", []):
+            if self._log_visible(tag):
+                self._insert_log_line(ts, msg, tag)
 
     def _set_status(self, text: str, color: str = None):
         color = color or C["text2"]
-        self.after(0, lambda: self.lbl_status.configure(text=text, fg=color))
-        self.after(0, lambda: self.lbl_statusbar.configure(text=text))
+        self.lbl_status.configure(text=text, fg=color)
+        self.status_strip.configure(bg=color)
+        self.lbl_statusbar.configure(text=text)
 
     def _set_current(self, text: str):
-        self.after(0, lambda: self.lbl_current.configure(text=text))
+        self.lbl_current.configure(text=text)
+
+    def _toast(self, message: str, kind: str = "info", ms: int = 3200):
+        """Non-blocking notification in the bottom-right corner."""
+        colors = {
+            "ok": (C["green"], C["green_dim"]),
+            "warn": (C["yellow"], C["yellow_dim"]),
+            "error": (C["red"], C["red_dim"]),
+            "info": (C["accent"], C["accent_dim"]),
+        }
+        fg, bg = colors.get(kind, colors["info"])
+        icon = {"ok": "✓", "warn": "!", "error": "✗"}.get(kind, "◈")
+
+        old = getattr(self, "_toast_widget", None)
+        if old is not None:
+            old.destroy()
+        toast = tk.Frame(self, bg=fg, padx=1, pady=1)
+        tk.Label(
+            toast,
+            text=f"  {icon}  {message}  ",
+            bg=bg,
+            fg=fg,
+            font=FONT_MONO_SM,
+            pady=8,
+            padx=6,
+        ).pack()
+        toast.place(relx=1.0, rely=1.0, x=-18, y=-36, anchor="se")
+        toast.lift()
+        toast.bind("<Button-1>", lambda e: toast.destroy())
+        self._toast_widget = toast
+        self.after(ms, lambda: toast.winfo_exists() and toast.destroy())
 
     # ─────────────────────────── SCAN CONTROL ───────────────────────────
+
+    _SCAN_TYPE_MAP = {
+        "TCP Connect": ScanType.TCP_CONNECT,
+        "UDP": ScanType.UDP,
+        "SYN Stealth*": ScanType.SYN_STEALTH,
+        "ACK*": ScanType.ACK,
+        "FIN*": ScanType.FIN,
+        "XMAS*": ScanType.XMAS,
+        "NULL*": ScanType.NULL,
+        "Window*": ScanType.WINDOW,
+    }
 
     def _get_scan_config(self) -> ScanConfig:
         """Build ScanConfig from UI state."""
@@ -1294,36 +2050,33 @@ class NexScanApp(tk.Tk):
         if not ports:
             raise ValueError("No valid ports specified.")
 
-        scan_type_map = {
-            "TCP Connect": ScanType.TCP_CONNECT,
-            "UDP": ScanType.UDP,
-            "SYN Stealth*": ScanType.SYN_STEALTH,
-            "ACK*": ScanType.ACK,
-            "FIN*": ScanType.FIN,
-            "XMAS*": ScanType.XMAS,
-            "NULL*": ScanType.NULL,
-            "Window*": ScanType.WINDOW,
-        }
-        stype = scan_type_map.get(self.var_scan_type.get(), ScanType.TCP_CONNECT)
+        stype = self._SCAN_TYPE_MAP.get(self.var_scan_type.get(), ScanType.TCP_CONNECT)
+        if stype in RAW_SCAN_TYPES and not self._raw_ok:
+            raise ValueError(self._raw_reason or "Raw scans are not available.")
 
-        return ScanConfig(
-            targets=targets,
-            ports=ports,
-            scan_type=stype,
-            threads=self.var_threads.get(),
-            timeout=self.var_timeout.get(),
-            connect_timeout=self.var_connect_timeout.get(),
-            grab_banners=self.var_banner_grab.get(),
-            detect_service=self.var_service_detect.get(),
-            detect_os=self.var_os_detect.get(),
-            ssl_probe=self.var_ssl_probe.get(),
-            rate_limit=self.var_rate_limit.get() / 1000.0,
-            retry_count=self.var_retry.get(),
-            jitter=getattr(self, "var_jitter", tk.DoubleVar(value=0.0)).get(),
-            max_banner_wait=getattr(self, "var_max_banner", tk.DoubleVar(value=2.0)).get(),
-            host_discovery=self.var_host_discovery.get(),
-            udp_payload_probes=getattr(self, "var_udp_probes", tk.BooleanVar(value=True)).get(),
-        )
+        try:
+            threads = max(1, min(1000, int(self.var_threads.get())))
+            return ScanConfig(
+                targets=targets,
+                ports=ports,
+                scan_type=stype,
+                threads=threads,
+                timeout=max(0.05, float(self.var_timeout.get())),
+                connect_timeout=max(0.05, float(self.var_connect_timeout.get())),
+                grab_banners=self.var_banner_grab.get(),
+                detect_service=self.var_service_detect.get(),
+                detect_os=self.var_os_detect.get(),
+                ssl_probe=self.var_ssl_probe.get(),
+                rate_limit=max(0.0, float(self.var_rate_limit.get())) / 1000.0,
+                retry_count=max(1, int(self.var_retry.get())),
+                jitter=max(0.0, float(self.var_jitter.get())),
+                max_banner_wait=max(0.1, float(self.var_max_banner.get())),
+                host_discovery=self.var_host_discovery.get(),
+                udp_payload_probes=self.var_udp_probes.get(),
+                reverse_dns=self.var_quick_resolve.get(),
+            )
+        except (tk.TclError, ValueError) as e:
+            raise ValueError(f"Invalid numeric setting: {e}") from e
 
     def _start_scan(self):
         if self.is_scanning:
@@ -1351,6 +2104,9 @@ class NexScanApp(tk.Tk):
         self.is_scanning = True
         self.is_paused = False
         self.scan_start_time = time.time()
+        self._paused_total = 0.0
+        self._pause_started = None
+        self._update_controls()
 
         self.stat_total_ports.set(total)
         self._set_status("SCANNING", C["green"])
@@ -1379,7 +2135,6 @@ class NexScanApp(tk.Tk):
     def _run_scan(self):
         try:
             results = self.scanner.run()
-            self.scan_results = results
             self._ui_queue.put(("scan_complete", results))
         except Exception as e:
             self._ui_queue.put(("scan_error", str(e)))
@@ -1390,13 +2145,18 @@ class NexScanApp(tk.Tk):
         if self.is_paused:
             self.scanner.resume()
             self.is_paused = False
+            if self._pause_started:
+                self._paused_total += time.time() - self._pause_started
+                self._pause_started = None
             self._set_status("SCANNING", C["green"])
             self._log("Scan resumed.", "info")
         else:
             self.scanner.pause()
             self.is_paused = True
+            self._pause_started = time.time()
             self._set_status("PAUSED", C["yellow"])
             self._log("Scan paused.", "info")
+        self._update_controls()
 
     def _stop_scan(self):
         if not self.is_scanning:
@@ -1407,8 +2167,19 @@ class NexScanApp(tk.Tk):
         )
         if ok and self.scanner:
             self.scanner.stop()
+            self.is_paused = False
             self._set_status("STOPPING...", C["red"])
             self._log("Stop requested...", "error")
+            self._update_controls()
+
+    def _active_elapsed(self) -> float:
+        """Elapsed scan time excluding time spent paused."""
+        if not self.scan_start_time:
+            return 0.0
+        paused = self._paused_total
+        if self._pause_started:
+            paused += time.time() - self._pause_started
+        return max(0.0, time.time() - self.scan_start_time - paused)
 
     def _on_port_found(self, target: str, port_result: PortResult):
         """Called from scan thread when an open port is found."""
@@ -1423,13 +2194,24 @@ class NexScanApp(tk.Tk):
         self._ui_queue.put(("host_complete", result))
 
     def _poll_queue(self):
-        """Process UI queue messages (called from main thread)."""
+        """Process UI queue messages (called from main thread).
+
+        Progress updates arrive once per probed port; only the latest one per
+        poll is rendered, and work per tick is time-boxed to keep the UI fluid.
+        """
+        deadline = time.perf_counter() + 0.04
+        last_progress = None
         try:
-            while True:
+            while time.perf_counter() < deadline:
                 msg = self._ui_queue.get_nowait()
-                self._handle_queue_msg(msg)
+                if msg[0] == "progress":
+                    last_progress = msg
+                else:
+                    self._handle_queue_msg(msg)
         except queue.Empty:
             pass
+        if last_progress is not None:
+            self._handle_queue_msg(last_progress)
         self.after(30, self._poll_queue)
 
     def _handle_queue_msg(self, msg):
@@ -1437,137 +2219,263 @@ class NexScanApp(tk.Tk):
 
         if kind == "port_found":
             _, target, pr = msg
-            self._add_result_row(target, pr)
+            self._store_row(target, pr)
+            counts = self._live_counts.setdefault(target, {"open": 0, "filtered": 0})
             if pr.state == PortState.OPEN:
-                self.stat_open.set(self.stat_open.get() + 1)
+                counts["open"] += 1
             elif pr.state in (PortState.FILTERED, PortState.OPEN_FILTERED):
-                self.stat_filtered.set(self.stat_filtered.get() + 1)
+                counts["filtered"] += 1
+            self._recount_stats()
 
-            tag = pr.state.value.split("|")[0]
-            log_msg = f"[{target}:{pr.port}/{pr.protocol}] {pr.state.value:<15} {pr.service:<18} {pr.version[:30]}"
+            log_msg = (
+                f"[{target}:{pr.port}/{pr.protocol}] {pr.state.value:<15} "
+                f"{pr.service:<18} {pr.version[:30]}"
+            )
+            if pr.state in (PortState.OPEN, PortState.OPEN_FILTERED):
+                self._log(log_msg, "open" if pr.state == PortState.OPEN else "filtered")
             if pr.banner:
-                banner_line = pr.banner.splitlines()[0][:60]
-                self._log(log_msg, "open" if pr.state == PortState.OPEN else "filtered")
-                self._log(f"  ↳ Banner: {banner_line}", "banner")
-            elif pr.state in (PortState.OPEN, PortState.OPEN_FILTERED):
-                self._log(log_msg, "open" if pr.state == PortState.OPEN else "filtered")
-
+                self._log(f"  ↳ Banner: {pr.banner.splitlines()[0][:60]}", "banner")
             if pr.ssl_info and pr.ssl_info.get("version"):
-                self._log(
-                    f"  ↳ SSL: {pr.ssl_info['version']}  CN={pr.ssl_info.get('common_name', '')}",
-                    "ssl",
-                )
+                cn = pr.ssl_info.get("common_name", "")
+                note = "  ⚠ EXPIRED" if pr.ssl_info.get("expired") else ""
+                self._log(f"  ↳ SSL: {pr.ssl_info['version']}  CN={cn}{note}", "ssl")
 
         elif kind == "progress":
             _, done, total, target, hdone, htotal = msg
-            pct = int(done / total * 100) if total else 0
+            pct = done / total * 100 if total else 0
             self.progress["value"] = pct
-            self.lbl_progress.configure(text=f"{pct}%")
+            self.lbl_progress.configure(text=f"{int(pct)}%")
             self.stat_ports_done.set(done)
             self._set_current(f"{target} [{hdone}/{htotal}]")
+            self.title(f"NexScan — {int(pct)}% scanning…")
 
-            # Calculate ETA
-            if done > 0 and total > 0 and self.is_scanning:
-                elapsed = time.time() - self.scan_start_time
-                rate = done / elapsed if elapsed > 0 else 1
+            # ETA / throughput (paused time excluded)
+            elapsed = self._active_elapsed()
+            if done > 0 and total > 0 and self.is_scanning and elapsed > 0:
+                rate = done / elapsed
                 remaining = (total - done) / rate if rate > 0 else 0
-                m, s = int(remaining) // 60, int(remaining) % 60
-                eta_str = f"{m}m {s}s" if m > 0 else f"{s}s"
-                self.stat_eta.set(eta_str)
+                self.stat_eta.set(self._fmt_duration(remaining))
+                self.lbl_rate.configure(text=f"{rate:,.0f} p/s")
             else:
                 self.stat_eta.set("—")
 
         elif kind == "host_complete":
             _, result = msg
-            self.stat_hosts_up.set(self.stat_hosts_up.get() + (1 if result.host_up else 0))
+            self._ingest_host_result(result)
             status = "UP" if result.host_up else "DOWN"
-            self._log(
+            line = (
                 f"Host {result.target} ({result.ip_address}) — {status}  "
                 f"Open:{result.open_count} Filtered:{result.filtered_count}  "
-                f"Duration:{result.scan_duration:.2f}s",
-                "host",
+                f"Duration:{result.scan_duration:.2f}s"
             )
-            if result.os_guess:
+            if result.extra.get("error"):
+                line += f"  ({result.extra['error']})"
+            self._log(line, "host" if result.host_up else "closed")
+            if result.os_guess and result.os_guess != "Unknown":
                 self._log(
                     f"  ↳ OS Guess: {result.os_guess} ({result.os_confidence}% confidence)", "info"
                 )
+            self._recount_stats()
             self._update_host_list()
-            self._update_stats_tab()
+            self._schedule_stats_refresh()
 
         elif kind == "scan_complete":
             _, results = msg
+            self.scan_results = list(results)
+            stopped = self.scanner.is_stopped() if self.scanner else False
             self.is_scanning = False
-            self._set_status("COMPLETE", C["accent"])
-            elapsed = time.time() - self.scan_start_time
+            self.is_paused = False
+            self._update_controls()
+            self.title(f"NexScan v{self.VERSION} — Advanced Port Scanner")
+            self._set_status(
+                "STOPPED" if stopped else "COMPLETE", C["red"] if stopped else C["accent"]
+            )
+            elapsed = self._active_elapsed()
             self._log(
-                f"Scan complete in {elapsed:.1f}s  "
+                f"Scan {'stopped' if stopped else 'complete'} in {elapsed:.1f}s  "
                 f"Open:{self.stat_open.get()}  "
                 f"Filtered:{self.stat_filtered.get()}  "
                 f"Hosts up:{self.stat_hosts_up.get()}",
                 "info",
             )
-            self.progress["value"] = 100
-            self.lbl_progress.configure(text="100%")
+            if not stopped:
+                self.progress["value"] = 100
+                self.lbl_progress.configure(text="100%")
+            self.stat_eta.set("—")
+            self._recount_stats()
+            self._update_host_list()
             self._update_stats_tab()
+            self._refresh_results_view()  # apply sort order to rows streamed live
+            if self.var_autosave.get():
+                self._save_current_to_history(quiet=True)
+            self._toast(
+                f"Scan {'stopped' if stopped else 'complete'} — "
+                f"{self.stat_open.get()} open port(s) on {self.stat_hosts_up.get()} host(s)",
+                "warn" if stopped else "ok",
+            )
+            self.bell()
 
         elif kind == "scan_error":
             _, err = msg
             self.is_scanning = False
+            self.is_paused = False
+            self._update_controls()
+            self.title(f"NexScan v{self.VERSION} — Advanced Port Scanner")
             self._set_status("ERROR", C["red"])
             self._log(f"Scan error: {err}", "error")
             messagebox.showerror("Scan Error", str(err))
 
-    def _add_result_row(self, target: str, pr: PortResult):
-        """Add a row to the results treeview."""
-        show_filtered = self.var_show_filtered.get()
-        show_closed = self.var_show_closed.get()
+        elif kind == "log":
+            _, text, tag = msg
+            self._log(text, tag)
 
-        if pr.state == PortState.OPEN:
-            tag = "open"
-        elif pr.state in (PortState.FILTERED, PortState.OPEN_FILTERED):
-            if not show_filtered:
-                return
-            tag = "filtered"
-        else:
-            if not show_closed:
-                return
-            tag = "closed"
+        elif kind == "vuln_cves":
+            self._render_cves(*msg[1:])
 
-        rtt = f"{pr.response_time * 1000:.1f}"
-        banner_short = pr.banner.splitlines()[0][:80] if pr.banner else ""
+        elif kind == "vuln_text":
+            _, text, tag = msg
+            self._vuln_write(text, tag)
 
-        # Filter check
-        ftext = self.var_filter_text.get().lower()
-        row_str = f"{target} {pr.port} {pr.protocol} {pr.state.value} {pr.service} {pr.version} {banner_short}".lower()
-        if ftext and ftext not in row_str:
+        elif kind == "vuln_status":
+            self.lbl_vuln_status.configure(text=msg[1])
+
+        elif kind == "vuln_done":
+            _, summary, count = msg
+            self._set_vuln_busy(False, summary)
+            if count >= 0:
+                self._vuln_write(f"\n{summary}\n", "header")
+            self._toast(summary, "warn" if count > 0 else "ok")
+
+    @staticmethod
+    def _fmt_duration(seconds: float) -> str:
+        seconds = int(seconds)
+        h, rem = divmod(seconds, 3600)
+        m, s = divmod(rem, 60)
+        if h:
+            return f"{h}h {m:02d}m"
+        return f"{m}m {s:02d}s" if m else f"{s}s"
+
+    # ── live result store ──
+
+    @staticmethod
+    def _row_key(target: str, pr: PortResult) -> str:
+        return f"{target}|{pr.protocol}|{pr.port}"
+
+    def _ingest_host_result(self, result: ScanResult):
+        """Record a finished host: keep it in scan_results and store all its rows."""
+        self.scan_results = [r for r in self.scan_results if r.target != result.target]
+        self.scan_results.append(result)
+        self._live_counts[result.target] = {
+            "open": result.open_count,
+            "filtered": result.filtered_count,
+            "up": 1 if result.host_up else 0,
+        }
+        for pr in result.ports:
+            self._store_row(result.target, pr)
+
+    def _store_row(self, target: str, pr: PortResult):
+        key = self._row_key(target, pr)
+        is_new = key not in self._rows
+        self._rows[key] = (target, pr)
+        if is_new:
+            self._add_result_row(target, pr)
+
+    def _recount_stats(self):
+        counts = self._live_counts.values()
+        self.stat_open.set(sum(c.get("open", 0) for c in counts))
+        self.stat_filtered.set(sum(c.get("filtered", 0) for c in counts))
+        self.stat_hosts_up.set(sum(c.get("up", 0) for c in counts))
+
+    def _schedule_stats_refresh(self):
+        """Statistics are rebuilt at most twice a second while hosts complete."""
+        if getattr(self, "_stats_job", None):
             return
 
-        iid = self.tree.insert(
-            "",
-            "end",
-            values=(
-                target,
-                pr.port,
-                pr.protocol.upper(),
-                pr.state.value,
-                pr.service,
-                pr.version,
-                rtt,
-                banner_short,
-            ),
-            tags=(tag,),
+        def run():
+            self._stats_job = None
+            self._update_stats_tab()
+
+        self._stats_job = self.after(500, run)
+
+    def _state_tag(self, pr: PortResult):
+        """Tree tag for a port, or None if hidden by the show-filtered/closed toggles."""
+        if pr.state == PortState.OPEN:
+            if pr.ssl_info and pr.ssl_info.get("expired"):
+                return "warn"
+            return "open"
+        if pr.state in (PortState.FILTERED, PortState.OPEN_FILTERED):
+            return "filtered" if self.var_show_filtered.get() else None
+        return "closed" if self.var_show_closed.get() else None
+
+    def _compile_filter(self):
+        """Return a predicate for the filter box (None = no filter)."""
+        ftext = self.var_filter_text.get().strip().lower()
+        if not ftext:
+            self.entry_filter.configure(highlightbackground=C["border2"])
+            return None
+        if self.var_filter_regex.get():
+            try:
+                rx = re.compile(ftext, re.IGNORECASE)
+            except re.error:
+                self.entry_filter.configure(highlightbackground=C["red"])
+                return lambda row: True
+            self.entry_filter.configure(highlightbackground=C["accent2"])
+            return lambda row: bool(rx.search(row))
+        self.entry_filter.configure(highlightbackground=C["accent2"])
+        terms = ftext.split()
+        return lambda row: all(t in row for t in terms)
+
+    @staticmethod
+    def _row_values(target: str, pr: PortResult) -> tuple:
+        banner_short = pr.banner.splitlines()[0][:80] if pr.banner else ""
+        return (
+            target,
+            pr.port,
+            pr.protocol.upper(),
+            pr.state.value,
+            pr.service,
+            pr.version,
+            f"{pr.response_time * 1000:.1f}",
+            banner_short,
         )
 
-        # Alternating row
-        count = len(self.tree.get_children())
-        if count % 2 == 0:
-            self.tree.item(iid, tags=(tag, "alt"))
+    def _row_passes(self, target: str, pr: PortResult, predicate) -> bool:
+        host_filter = self.var_host_filter.get()
+        if host_filter != "All" and target != host_filter:
+            return False
+        if predicate is None:
+            return True
+        values = self._row_values(target, pr)
+        return predicate(" ".join(str(v) for v in values).lower())
+
+    def _add_result_row(self, target: str, pr: PortResult):
+        """Insert one row live (if it passes the current filters)."""
+        tag = self._state_tag(pr)
+        if tag is None or not self._row_passes(target, pr, self._compile_filter()):
+            return
+        iid = self._row_key(target, pr)
+        if self.tree.exists(iid):
+            return
+        stripe = "even" if self._row_counter % 2 == 0 else "odd"
+        self._row_counter += 1
+        self.tree.insert(
+            "", "end", iid=iid, values=self._row_values(target, pr), tags=(tag, stripe)
+        )
+        self._update_result_count()
+
+    def _update_result_count(self):
+        n = len(self.tree.get_children())
+        self.lbl_result_count.configure(text=f"{n:,} result{'s' if n != 1 else ''}")
+        if n:
+            self.lbl_empty.place_forget()
+        else:
+            self.lbl_empty.place(relx=0.5, rely=0.45, anchor="center")
 
     def _update_timer(self):
         if not self.is_scanning:
             return
         if not self.is_paused:
-            elapsed = int(time.time() - self.scan_start_time)
+            elapsed = int(self._active_elapsed())
             h, m, s = elapsed // 3600, (elapsed % 3600) // 60, elapsed % 60
             self.lbl_timer.configure(text=f"{h:02d}:{m:02d}:{s:02d}", fg=C["accent"])
             self.lbl_timer_icon.configure(fg=C["accent"])
@@ -1578,10 +2486,15 @@ class NexScanApp(tk.Tk):
         self.cb_host_filter["values"] = hosts
 
         self.host_listbox.delete(0, "end")
-        for r in self.scan_results:
+        for i, r in enumerate(self.scan_results):
             status = "▲" if r.host_up else "▼"
-            color = C["green"] if r.host_up else C["red"]
             self.host_listbox.insert("end", f"{status} {r.target}  [{r.open_count} open]")
+            color = (
+                C["green"]
+                if r.host_up and r.open_count
+                else (C["text"] if r.host_up else C["text3"])
+            )
+            self.host_listbox.itemconfigure(i, foreground=color)
 
     def _on_host_select(self, event):
         sel = self.host_listbox.curselection()
@@ -1780,100 +2693,83 @@ class NexScanApp(tk.Tk):
     # ─────────────────────────── FILTER & SORT ───────────────────────────
 
     def _apply_filter(self, *args):
+        """Debounced: typing in the filter box rebuilds the view once typing pauses."""
+        if self._refresh_job is not None:
+            self.after_cancel(self._refresh_job)
+        self._refresh_job = self.after(120, self._refresh_results_view)
+
+    _SORT_KEYS = {
+        "host": lambda t, p: t,
+        "port": lambda t, p: p.port,
+        "proto": lambda t, p: p.protocol,
+        "state": lambda t, p: p.state.value,
+        "service": lambda t, p: p.service.lower(),
+        "version": lambda t, p: p.version.lower(),
+        "rtt": lambda t, p: p.response_time,
+        "banner": lambda t, p: p.banner.lower(),
+    }
+
+    def _on_sort_preset(self, _event=None):
+        self._header_sort = None
         self._refresh_results_view()
 
     def _refresh_results_view(self):
-        """Rebuild the treeview from scan_results with current filters/sort."""
-        import re
-
+        """Rebuild the treeview from the live row store with current filters/sort."""
+        self._refresh_job = None
         self.tree.delete(*self.tree.get_children())
-
-        host_filter = self.var_host_filter.get()
-        ftext = self.var_filter_text.get().lower()
-        use_regex = self.var_filter_regex.get()
-        show_filtered = self.var_show_filtered.get()
-        show_closed = self.var_show_closed.get()
-        sort_val = self.var_sort.get()
-
-        # Compile regex if needed
-        regex_pattern = None
-        if ftext and use_regex:
-            try:
-                regex_pattern = re.compile(ftext, re.IGNORECASE)
-            except re.error:
-                self._log(f"Invalid regex: {ftext}", "error")
-                regex_pattern = None
+        predicate = self._compile_filter()
 
         all_rows = []
-        for result in self.scan_results:
-            if host_filter != "All" and result.target != host_filter:
+        for target, p in self._rows.values():
+            tag = self._state_tag(p)
+            if tag is None or not self._row_passes(target, p, predicate):
                 continue
-            for p in result.ports:
-                if p.state == PortState.OPEN:
-                    tag = "open"
-                elif p.state in (PortState.FILTERED, PortState.OPEN_FILTERED):
-                    if not show_filtered:
-                        continue
-                    tag = "filtered"
-                else:
-                    if not show_closed:
-                        continue
-                    tag = "closed"
+            all_rows.append((target, p, tag))
 
-                banner_short = p.banner.splitlines()[0][:80] if p.banner else ""
-                row_str = f"{result.target} {p.port} {p.protocol} {p.state.value} {p.service} {p.version} {banner_short}".lower()
+        # Sort: heading click wins over the preset combobox
+        if self._header_sort:
+            col, desc = self._header_sort
+            key = self._SORT_KEYS.get(col, self._SORT_KEYS["port"])
+            all_rows.sort(key=lambda x: (key(x[0], x[1]), x[1].port), reverse=desc)
+        else:
+            sort_val = self.var_sort.get()
+            if sort_val == "Port ↓":
+                all_rows.sort(key=lambda x: (-x[1].port, x[0]))
+            elif sort_val == "Service":
+                all_rows.sort(key=lambda x: (x[1].service, x[1].port))
+            elif sort_val == "Response Time":
+                all_rows.sort(key=lambda x: x[1].response_time)
+            elif sort_val == "State":
+                all_rows.sort(key=lambda x: (x[1].state.value, x[1].port))
+            else:  # Port ↑
+                all_rows.sort(key=lambda x: (x[1].port, x[0]))
 
-                # Apply filter
-                if ftext:
-                    if use_regex and regex_pattern:
-                        if not regex_pattern.search(row_str):
-                            continue
-                    elif not use_regex and ftext not in row_str:
-                        continue
-
-                all_rows.append((result.target, p, tag, banner_short))
-
-        # Sort
-        if sort_val == "Port ↑":
-            all_rows.sort(key=lambda x: x[1].port)
-        elif sort_val == "Port ↓":
-            all_rows.sort(key=lambda x: -x[1].port)
-        elif sort_val == "Service":
-            all_rows.sort(key=lambda x: x[1].service)
-        elif sort_val == "Response Time":
-            all_rows.sort(key=lambda x: x[1].response_time)
-        elif sort_val == "State":
-            all_rows.sort(key=lambda x: x[1].state.value)
-
-        for i, (target, p, tag, banner_short) in enumerate(all_rows):
-            rtt = f"{p.response_time * 1000:.1f}"
-            tags = (tag, "alt") if i % 2 == 0 else (tag,)
+        for i, (target, p, tag) in enumerate(all_rows):
             self.tree.insert(
                 "",
                 "end",
-                values=(
-                    target,
-                    p.port,
-                    p.protocol.upper(),
-                    p.state.value,
-                    p.service,
-                    p.version,
-                    rtt,
-                    banner_short,
-                ),
-                tags=tags,
+                iid=self._row_key(target, p),
+                values=self._row_values(target, p),
+                tags=(tag, "even" if i % 2 == 0 else "odd"),
             )
-
-        self.lbl_result_count.configure(text=f"{len(all_rows)} results")
+        self._row_counter = len(all_rows)
+        self._update_heading_arrows()
+        self._update_result_count()
 
     def _sort_tree(self, col: str):
-        items = [(self.tree.set(iid, col), iid) for iid in self.tree.get_children()]
-        try:
-            items.sort(key=lambda x: int(x[0]))
-        except (ValueError, TypeError):
-            items.sort(key=lambda x: x[0].lower())
-        for i, (_, iid) in enumerate(items):
-            self.tree.move(iid, "", i)
+        """Heading click: sort by column, clicking again toggles direction."""
+        if self._header_sort and self._header_sort[0] == col:
+            self._header_sort = (col, not self._header_sort[1])
+        else:
+            self._header_sort = (col, False)
+        self._refresh_results_view()
+
+    def _update_heading_arrows(self):
+        for col, label in self._col_labels.items():
+            text = label
+            if self._header_sort and self._header_sort[0] == col:
+                text += "  ▼" if self._header_sort[1] else "  ▲"
+            self.tree.heading(col, text=text)
 
     # ─────────────────────────── EXPORT ───────────────────────────
 
@@ -1889,17 +2785,12 @@ class NexScanApp(tk.Tk):
             bd=0,
             relief="solid",
         )
-        for label, fmt in [
-            ("Export as JSON", "json"),
-            ("Export as CSV", "csv"),
-            ("Export as HTML Report", "html"),
-            ("Export as XML", "xml"),
-            ("Export as Text", "txt"),
-        ]:
-            menu.add_command(label=label, command=lambda f=fmt: self._export(f))
+        for fmt, (_fn, _ext, label) in EXPORTERS.items():
+            menu.add_command(label=f"Export as {label}", command=lambda f=fmt: self._export(f))
 
         menu.add_separator()
         menu.add_command(label="Copy visible results", command=self._copy_results)
+        menu.add_command(label="Save to history", command=self._save_current_to_history)
         try:
             menu.tk_popup(self.winfo_pointerx(), self.winfo_pointery())
         finally:
@@ -1907,50 +2798,48 @@ class NexScanApp(tk.Tk):
 
     def _export(self, fmt: str):
         if not self.scan_results:
-            messagebox.showwarning("No Data", "No scan results to export.")
+            self._toast("No scan results to export", "warn")
             return
 
-        ext_map = {"json": ".json", "csv": ".csv", "html": ".html", "xml": ".xml", "txt": ".txt"}
-        ft_map = {
-            "json": [("JSON files", "*.json")],
-            "csv": [("CSV files", "*.csv")],
-            "html": [("HTML files", "*.html")],
-            "xml": [("XML files", "*.xml")],
-            "txt": [("Text files", "*.txt")],
-        }
-
+        fn, ext, label = EXPORTERS[fmt]
         ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        default = f"nexscan_{ts}{ext_map[fmt]}"
         path = filedialog.asksaveasfilename(
-            defaultextension=ext_map[fmt], filetypes=ft_map[fmt], initialfile=default
+            defaultextension=ext,
+            filetypes=[(f"{label} files", f"*{ext}"), ("All Files", "*.*")],
+            initialfile=f"nexscan_{ts}{ext}",
         )
         if not path:
             return
 
         try:
-            fn_map = {
-                "json": export_json,
-                "csv": export_csv,
-                "html": export_html,
-                "xml": export_xml,
-                "txt": export_txt,
-            }
-            content = fn_map[fmt](self.scan_results)
             with open(path, "w", encoding="utf-8") as f:
-                f.write(content)
-            self._log(f"Exported {fmt.upper()} report to: {path}", "info")
-            messagebox.showinfo("Export Successful", f"Report saved to:\n{path}")
+                f.write(fn(self.scan_results))
+            self._log(f"Exported {label} report to: {path}", "info")
+            self._toast(f"Saved {os.path.basename(path)}", "ok")
+            if fmt == "html" and messagebox.askyesno(
+                "Export Successful", f"Report saved to:\n{path}\n\nOpen it in your browser?"
+            ):
+                webbrowser.open(f"file://{os.path.abspath(path)}")
         except Exception as e:
             messagebox.showerror("Export Error", str(e))
 
     def _copy_results(self):
-        rows = []
-        for iid in self.tree.get_children():
+        self._copy_rows(self.tree.get_children(), "visible")
+
+    def _copy_selected_rows(self):
+        sel = self.tree.selection()
+        self._copy_rows(sel or self.tree.get_children(), "selected" if sel else "visible")
+
+    def _copy_rows(self, iids, what: str):
+        header = "\t".join(self._col_labels.values())
+        rows = [header]
+        for iid in iids:
             values = self.tree.item(iid, "values")
             rows.append("\t".join(str(v) for v in values))
         self.clipboard_clear()
         self.clipboard_append("\n".join(rows))
-        self._log(f"Copied {len(rows)} rows to clipboard.", "info")
+        self._log(f"Copied {len(rows) - 1} rows to clipboard.", "info")
+        self._toast(f"Copied {len(rows) - 1} {what} row(s)", "ok")
 
     # ─────────────────────────── MISC ───────────────────────────
 
@@ -1961,16 +2850,31 @@ class NexScanApp(tk.Tk):
             self.txt_ports.delete("1.0", "end")
             self.txt_ports.insert("1.0", ",".join(str(p) for p in ports))
             self._log(f"Applied preset '{preset}': {len(ports)} ports", "info")
+            self._count_ports()
 
     def _count_ports(self):
         port_text = self.txt_ports.get("1.0", "end").strip().replace("\n", ",")
         try:
             ports = parse_ports(port_text)
-            self.lbl_port_count.configure(
-                text=f"Ports to scan: {len(ports):,}", fg=C["green"] if ports else C["red"]
-            )
+            text, color = f"Ports to scan: {len(ports):,}", C["green"] if ports else C["red"]
         except Exception:
-            self.lbl_port_count.configure(text="Invalid port range", fg=C["red"])
+            text, color = "Invalid port range", C["red"]
+        self.lbl_port_count.configure(text=text, fg=color)
+        self.lbl_port_summary.configure(
+            text=f"{len(ports):,} port{'s' if len(ports) != 1 else ''} to scan" if ports else text,
+            fg=C["text2"] if ports else color,
+        )
+
+    def _count_targets(self):
+        targets = parse_targets(self.txt_targets.get("1.0", "end").strip())
+        n = len(targets)
+        if not n:
+            self.lbl_target_summary.configure(text="No valid targets", fg=C["red"])
+            return
+        preview = ", ".join(targets[:3]) + (" …" if n > 3 else "")
+        self.lbl_target_summary.configure(
+            text=f"{n:,} host{'s' if n != 1 else ''}: {preview}", fg=C["text2"]
+        )
 
     def _resolve_targets(self):
         target_text = self.txt_targets.get("1.0", "end").strip()
@@ -2002,36 +2906,52 @@ class NexScanApp(tk.Tk):
 
     def _clear_results_internal(self):
         self.scan_results = []
+        self._rows.clear()
+        self._live_counts.clear()
+        self._row_counter = 0
         self.tree.delete(*self.tree.get_children())
         self.host_listbox.delete(0, "end")
+        self.cb_host_filter["values"] = ["All"]
+        self.var_host_filter.set("All")
         self.stat_open.set(0)
         self.stat_filtered.set(0)
         self.stat_hosts_up.set(0)
         self.stat_ports_done.set(0)
+        self.stat_eta.set("—")
         self.progress["value"] = 0
         self.lbl_progress.configure(text="0%")
+        self.lbl_rate.configure(text="")
         self.lbl_timer.configure(text="00:00:00", fg=C["text3"])
         self.lbl_timer_icon.configure(fg=C["text3"])
-        self.lbl_result_count.configure(text="0 results")
+        self._update_result_count()
         self._set_status("IDLE", C["text2"])
         self._set_current("—")
 
-        st = self.stats_text
-        st.configure(state="normal")
-        st.delete("1.0", "end")
-        st.configure(state="disabled")
+        for widget in (self.stats_text, self.detail_text):
+            widget.configure(state="normal")
+            widget.delete("1.0", "end")
+            widget.configure(state="disabled")
+        self._update_stats_tab()
 
     def _clear_log(self):
         self.txt_log.configure(state="normal")
         self.txt_log.delete("1.0", "end")
         self.txt_log.configure(state="disabled")
 
+    _WEB_SERVICES = ("http", "https", "http-proxy", "http-alt", "https-alt", "www")
+
     def _tree_context_menu(self, event):
         iid = self.tree.identify_row(event.y)
         if not iid:
             return
-        self.tree.selection_set(iid)
-        values = self.tree.item(iid, "values")
+        if iid not in self.tree.selection():
+            self.tree.selection_set(iid)
+        self.tree.focus(iid)
+        entry = self._rows.get(iid)
+        if not entry:
+            return
+        target, pr = entry
+        host, port = target, pr.port
 
         menu = tk.Menu(
             self,
@@ -2044,21 +2964,34 @@ class NexScanApp(tk.Tk):
             bd=0,
         )
 
-        host, port = values[0], values[1]
+        menu.add_command(label="Show Port Detail", command=lambda: self._show_port_popup_for(iid))
+        if pr.state == PortState.OPEN and (
+            pr.service in self._WEB_SERVICES or pr.service.startswith("http")
+        ):
+            scheme = "https" if pr.ssl_info or "https" in pr.service else "http"
+            url = f"{scheme}://{host}:{port}/"
+            menu.add_command(label=f"Open {url}", command=lambda: webbrowser.open(url))
+        menu.add_separator()
         menu.add_command(
             label=f"Copy {host}:{port}", command=lambda: self._copy_text(f"{host}:{port}")
         )
-        menu.add_command(label=f"Copy IP {host}", command=lambda: self._copy_text(host))
+        menu.add_command(label=f"Copy host {host}", command=lambda: self._copy_text(host))
+        if pr.banner:
+            menu.add_command(label="Copy banner", command=lambda: self._copy_text(pr.banner))
+        sel = len(self.tree.selection())
+        menu.add_command(label=f"Copy {sel} selected row(s)", command=self._copy_selected_rows)
         menu.add_separator()
-        menu.add_command(
-            label="Show Port Detail", command=lambda: self._show_port_detail_by_values(values)
-        )
         menu.add_command(
             label=f"Filter by port {port}", command=lambda: self.var_filter_text.set(str(port))
         )
         menu.add_command(
             label=f"Filter by host {host}", command=lambda: self.var_filter_text.set(host)
         )
+        if pr.service:
+            menu.add_command(
+                label=f"Filter by service {pr.service}",
+                command=lambda: self.var_filter_text.set(pr.service),
+            )
         menu.add_command(label="Clear filter", command=lambda: self.var_filter_text.set(""))
 
         try:
@@ -2069,35 +3002,51 @@ class NexScanApp(tk.Tk):
     def _copy_text(self, text: str):
         self.clipboard_clear()
         self.clipboard_append(text)
+        self._toast("Copied to clipboard", "ok", ms=1500)
 
     def _show_port_detail(self, event):
         iid = self.tree.focus()
-        if not iid:
+        if iid:
+            self._show_port_popup_for(iid)
+
+    def _show_port_popup_for(self, iid: str):
+        entry = self._rows.get(iid)
+        if not entry:
             return
-        values = self.tree.item(iid, "values")
-        self._show_port_detail_by_values(values)
+        target, pr = entry
+        result = next((r for r in self.scan_results if r.target == target), None)
+        if result is None:  # host still being scanned
+            result = ScanResult(target=target, ip_address=target)
+        self._show_port_popup(result, pr)
 
     def _show_port_detail_by_values(self, values):
         host, port_str = values[0], values[1]
-        try:
-            port = int(port_str)
-        except ValueError:
-            return
-
-        # Find result
-        for r in self.scan_results:
-            if r.target == host or r.ip_address == host:
-                for p in r.ports:
-                    if p.port == port:
-                        self._show_port_popup(r, p)
-                        return
+        proto = str(values[2]).lower() if len(values) > 2 else "tcp"
+        self._show_port_popup_for(f"{host}|{proto}|{port_str}")
 
     def _show_port_popup(self, result: ScanResult, pr: PortResult):
         popup = tk.Toplevel(self)
         popup.title(f"Port Detail — {result.target}:{pr.port}")
         popup.configure(bg=C["bg"])
-        popup.geometry("620x500")
+        popup.geometry("640x520")
         popup.resizable(True, True)
+        popup.transient(self)
+        popup.bind("<Escape>", lambda e: popup.destroy())
+
+        # Button row first so it stays visible when the text is long
+        btns = tk.Frame(popup, bg=C["bg"])
+        btns.pack(side="bottom", fill="x", pady=8)
+        self._make_button(btns, "  Close  ", popup.destroy).pack(side="right", padx=8)
+        self._make_button(
+            btns,
+            "Copy JSON",
+            lambda: self._copy_text(json.dumps(pr.to_dict(), indent=2)),
+            fg=C["accent"],
+        ).pack(side="right", padx=4)
+        if pr.banner:
+            self._make_button(
+                btns, "Copy Banner", lambda: self._copy_text(pr.banner), fg=C["orange"]
+            ).pack(side="right", padx=4)
 
         txt = tk.Text(
             popup,
@@ -2122,9 +3071,17 @@ class NexScanApp(tk.Tk):
             ("head", C["accent"]),
             ("banner", C["orange"]),
             ("ssl", C["accent2"]),
+            ("filtered", C["yellow"]),
+            ("closed", C["text3"]),
+            ("bad", C["red"]),
         ]:
             txt.tag_configure(tag, foreground=fg_c)
-        txt.tag_configure("bold", font=("Consolas", 10, "bold"))
+        txt.tag_configure("bold", font=(FONT_MONO[0], 10, "bold"))
+        state_tag = {
+            PortState.OPEN: "open",
+            PortState.FILTERED: "filtered",
+            PortState.OPEN_FILTERED: "filtered",
+        }.get(pr.state, "closed")
 
         def w(t, tag=None):
             txt.insert("end", t, tag)
@@ -2138,15 +3095,19 @@ class NexScanApp(tk.Tk):
         w("Port       : ", "key")
         w(f"{pr.port}/{pr.protocol.upper()}\n", "open")
         w("State      : ", "key")
-        w(f"{pr.state.value}\n", "open")
+        w(f"{pr.state.value}\n", state_tag)
         w("Service    : ", "key")
         w(f"{pr.service}\n", "val")
         w("Version    : ", "key")
         w(f"{pr.version}\n", "val")
-        w("CPE        : ", "key")
-        w(f"{pr.cpe}\n", "val")
+        if pr.cpe:
+            w("CPE        : ", "key")
+            w(f"{pr.cpe}\n", "val")
         w("RTT        : ", "key")
         w(f"{pr.response_time*1000:.2f}ms\n", "val")
+        if pr.extra_info:
+            w("Notes      : ", "key")
+            w(f"{pr.extra_info}\n", "val")
         w("\n")
 
         if pr.banner:
@@ -2159,25 +3120,50 @@ class NexScanApp(tk.Tk):
             w("SSL/TLS INFO\n", "head")
             w("─" * 50 + "\n", "key")
             ssl = pr.ssl_info
-            for k, v in ssl.items():
+            labels = [
+                ("version", "Protocol"),
+                ("cipher", "Cipher"),
+                ("cipher_bits", "Key bits"),
+                ("common_name", "Common name"),
+                ("san", "Alt names"),
+                ("issuer", "Issuer"),
+                ("not_before", "Valid from"),
+                ("not_after", "Valid until"),
+                ("days_left", "Days left"),
+                ("self_signed", "Self-signed"),
+            ]
+            for key, label in labels:
+                if key not in ssl or ssl[key] in ("", None, []):
+                    continue
+                v = ssl[key]
                 if isinstance(v, list):
-                    v = ", ".join(v[:5])
-                w(f"{k:<20}: ", "key")
-                w(f"{v}\n", "ssl")
+                    v = ", ".join(v[:6]) + (" …" if len(v) > 6 else "")
+                tag = "ssl"
+                if key == "days_left" and isinstance(v, int) and v < 30:
+                    tag = "bad"
+                    v = f"{v}  ({'EXPIRED' if v < 0 else 'expires soon'})"
+                if key == "self_signed":
+                    v, tag = ("yes", "bad") if v else ("no", "ssl")
+                if key == "version" and str(v) in ("SSLv3", "TLSv1", "TLSv1.1"):
+                    tag = "bad"
+                    v = f"{v}  (deprecated)"
+                w(f"{label:<12}: ", "key")
+                w(f"{v}\n", tag)
 
         txt.configure(state="disabled")
-
-        # Close button
-        self._make_button(
-            popup, "  Close  ", popup.destroy, fg=C["text"], bg=C["btn_bg"], hover_bg=C["btn_hover"]
-        ).pack(pady=8)
 
     def _show_about(self):
         popup = tk.Toplevel(self)
         popup.title("About NexScan")
         popup.configure(bg=C["bg"])
-        popup.geometry("580x480")
-        popup.resizable(False, False)
+        popup.geometry("600x560")
+        popup.resizable(False, True)
+        popup.transient(self)
+        popup.bind("<Escape>", lambda e: popup.destroy())
+
+        btns = tk.Frame(popup, bg=C["bg"])
+        btns.pack(side="bottom", fill="x", pady=10)
+        self._make_button(btns, "  Close  ", popup.destroy).pack()
 
         txt = tk.Text(
             popup,
@@ -2189,6 +3175,7 @@ class NexScanApp(tk.Tk):
             padx=24,
             pady=20,
             wrap="word",
+            highlightthickness=0,
         )
         txt.pack(fill="both", expand=True)
 
@@ -2196,67 +3183,120 @@ class NexScanApp(tk.Tk):
             ("h1", C["accent"], FONT_TITLE),
             ("h2", C["purple"], FONT_MONO_LG),
             ("key", C["text2"], FONT_MONO_SM),
+            ("kbd", C["accent"], FONT_MONO_SM),
             ("val", C["text"], FONT_MONO_SM),
         ]:
             txt.tag_configure(tag, foreground=fg_c, font=fnt)
+        txt.tag_configure("h2", spacing1=10, spacing3=4)
 
         txt.insert("end", "◈ NEXSCAN\n", "h1")
-        txt.insert("end", f"v{self.VERSION} — Advanced Port Scanner\n\n", "val")
-        txt.insert("end", "KEYBOARD SHORTCUTS\n", "h2")
-        txt.insert("end", "F5              Start scan\n", "key")
-        txt.insert("end", "Escape          Stop/Cancel scan\n", "key")
-        txt.insert("end", "Ctrl+E          Export results\n", "key")
-        txt.insert("end", "Ctrl+L          Clear results\n", "key")
-        txt.insert("end", "Ctrl+F          Focus filter box\n", "key")
-        txt.insert("end", "Ctrl+S          Save profile\n", "key")
-        txt.insert("end", "Ctrl+O          Load profile\n\n", "key")
-        txt.insert("end", "FEATURES\n", "h2")
-        txt.insert("end", "✓ Multi-protocol scanning (TCP/UDP/SYN)\n", "val")
-        txt.insert("end", "✓ Real-time progress with ETA\n", "val")
-        txt.insert("end", "✓ Regex & text filtering\n", "val")
-        txt.insert("end", "✓ Service detection & OS fingerprinting\n", "val")
-        txt.insert("end", "✓ SSL/TLS certificate inspection\n", "val")
-        txt.insert("end", "✓ Multiple export formats\n", "val")
-        txt.insert("end", "✓ Live event logging\n\n", "val")
-        txt.insert("end", "For authorized use only. Respect applicable laws.\n", "key")
+        txt.insert("end", f"v{self.VERSION} — Advanced Port Scanner\n", "val")
 
-        txt.configure(state="disabled")
-        txt.insert("end", f"  Advanced Port Scanner v{self.VERSION}\n\n", "key")
+        txt.insert("end", "KEYBOARD SHORTCUTS\n", "h2")
+        for keys, desc in [
+            ("F5", "Start scan"),
+            ("F6", "Pause / resume"),
+            ("Escape", "Stop / cancel scan"),
+            ("Ctrl+E", "Export results"),
+            ("Ctrl+L", "Clear results"),
+            ("Ctrl+F", "Focus filter box"),
+            ("Ctrl+C", "Copy selected rows"),
+            ("Ctrl+S / Ctrl+O", "Save / load profile"),
+            ("Ctrl+H", "Scan history"),
+        ]:
+            txt.insert("end", f"  {keys:<18}", "kbd")
+            txt.insert("end", f"{desc}\n", "key")
+
         txt.insert("end", "CAPABILITIES\n", "h2")
         features = [
-            "Multi-threaded TCP Connect scanning",
-            "UDP scanning with service probes",
-            "Banner grabbing & service fingerprinting",
-            "SSL/TLS certificate inspection",
-            "Heuristic OS detection",
-            "CIDR range & multi-host scanning",
-            "Real-time live results stream",
-            "Export: JSON, CSV, HTML, XML, TXT",
-            "Port presets & custom ranges",
-            "Host discovery & reverse DNS",
-            "Result filtering & sorting",
-            "Pause/Resume scan control",
+            "TCP Connect, UDP and raw SYN / ACK / FIN / XMAS / NULL / Window scans",
+            "Shared worker pool across hosts with parallel host discovery",
+            "Protocol-aware banner grabbing & product/version fingerprinting",
+            "TLS certificate inspection with expiry warnings",
+            "Heuristic OS detection (TTL + port fingerprint)",
+            "CIDR, IP ranges and multi-host scanning",
+            "Live, filterable results with pause / resume and ETA",
+            "Export: JSON, CSV, HTML, XML, Markdown, TXT",
+            "Scan history with run-to-run diffs",
+            "CVE lookup (NVD) and geolocation / RDAP WHOIS",
         ]
         for f in features:
             txt.insert("end", f"  ✓ {f}\n", "key")
 
-        txt.insert("end", "\n⚠ LEGAL NOTICE\n", "h2")
+        txt.insert("end", "⚠ LEGAL NOTICE\n", "h2")
         txt.insert(
             "end",
             "  Only scan systems you own or have explicit permission\n"
             "  to scan. Unauthorized port scanning may be illegal.\n",
             "key",
         )
-
         txt.configure(state="disabled")
 
-        self._make_button(
-            popup, "  Close  ", popup.destroy, fg=C["text"], bg=C["btn_bg"], hover_bg=C["btn_hover"]
-        ).pack(pady=10)
+    # ─────────────────────────── PROFILES & SETTINGS ───────────────────────────
+
+    def _profile_vars(self) -> dict:
+        """Settings captured in profiles and remembered between sessions."""
+        return {
+            "scan_type": self.var_scan_type,
+            "threads": self.var_threads,
+            "timeout": self.var_timeout,
+            "connect_timeout": self.var_connect_timeout,
+            "rate_limit_ms": self.var_rate_limit,
+            "attempts": self.var_retry,
+            "jitter_ms": self.var_jitter,
+            "banner_wait": self.var_max_banner,
+            "banner_grab": self.var_banner_grab,
+            "service_detect": self.var_service_detect,
+            "os_detect": self.var_os_detect,
+            "ssl_probe": self.var_ssl_probe,
+            "host_discovery": self.var_host_discovery,
+            "udp_probes": self.var_udp_probes,
+            "reverse_dns": self.var_quick_resolve,
+            "show_filtered": self.var_show_filtered,
+            "show_closed": self.var_show_closed,
+            "port_preset": self.var_port_preset,
+        }
+
+    def _collect_profile(self) -> dict:
+        profile = {
+            "targets": self.txt_targets.get("1.0", "end").strip(),
+            "ports": self.txt_ports.get("1.0", "end").strip(),
+        }
+        for key, var in self._profile_vars().items():
+            try:
+                profile[key] = var.get()
+            except tk.TclError:
+                pass
+        return profile
+
+    def _apply_profile(self, profile: dict):
+        if "targets" in profile:
+            self.txt_targets.delete("1.0", "end")
+            self.txt_targets.insert("1.0", profile["targets"])
+        if "ports" in profile:
+            self.txt_ports.delete("1.0", "end")
+            self.txt_ports.insert("1.0", profile["ports"])
+
+        # Accept keys written by older versions
+        legacy = {"retries": "attempts"}
+        for old, new in legacy.items():
+            if old in profile and new not in profile:
+                profile[new] = max(1, int(profile[old]))
+
+        for key, var in self._profile_vars().items():
+            if key in profile:
+                try:
+                    var.set(profile[key])
+                except (tk.TclError, ValueError, TypeError):
+                    pass
+        if self.var_scan_type.get() not in self._SCAN_TYPE_MAP:
+            self.var_scan_type.set("TCP Connect")
+        self._update_scan_type_hint()
+        self._count_ports()
+        self._count_targets()
 
     def _save_profile(self):
         """Save current scan configuration as a profile."""
-
         file = filedialog.asksaveasfilename(
             defaultextension=".json",
             filetypes=[("NexScan Profile", "*.json"), ("All Files", "*.*")],
@@ -2264,70 +3304,77 @@ class NexScanApp(tk.Tk):
         )
         if not file:
             return
-
-        profile = {
-            "targets": self.txt_targets.get("1.0", "end").strip(),
-            "ports": self.txt_ports.get("1.0", "end").strip(),
-            "scan_type": self.var_scan_type.get(),
-            "threads": self.var_threads.get(),
-            "timeout": self.var_timeout.get(),
-            "connect_timeout": self.var_connect_timeout.get(),
-            "banner_grab": self.var_banner_grab.get(),
-            "service_detect": self.var_service_detect.get(),
-            "os_detect": self.var_os_detect.get(),
-            "ssl_probe": self.var_ssl_probe.get(),
-            "host_discovery": self.var_host_discovery.get(),
-        }
         try:
-            with open(file, "w") as f:
-                json.dump(profile, f, indent=2)
+            with open(file, "w", encoding="utf-8") as f:
+                json.dump(self._collect_profile(), f, indent=2)
             self._log(f"Profile saved to {file}", "info")
-            messagebox.showinfo("Success", f"Profile saved to\n{file}")
+            self._toast(f"Profile saved: {os.path.basename(file)}", "ok")
         except Exception as e:
             messagebox.showerror("Error", f"Failed to save profile: {e}")
 
     def _load_profile(self):
         """Load a saved scan configuration profile."""
-
         file = filedialog.askopenfilename(
             filetypes=[("NexScan Profile", "*.json"), ("All Files", "*.*")]
         )
         if not file:
             return
-
         try:
-            with open(file, "r") as f:
-                profile = json.load(f)
-
-            self.txt_targets.delete("1.0", "end")
-            self.txt_targets.insert("1.0", profile.get("targets", ""))
-
-            self.txt_ports.delete("1.0", "end")
-            self.txt_ports.insert("1.0", profile.get("ports", ""))
-
-            self.var_scan_type.set(profile.get("scan_type", "TCP Connect"))
-            self.var_threads.set(profile.get("threads", 300))
-            self.var_timeout.set(profile.get("timeout", 1.5))
-            self.var_connect_timeout.set(profile.get("connect_timeout", 3.0))
-            self.var_banner_grab.set(profile.get("banner_grab", True))
-            self.var_service_detect.set(profile.get("service_detect", True))
-            self.var_os_detect.set(profile.get("os_detect", False))
-            self.var_ssl_probe.set(profile.get("ssl_probe", True))
-            self.var_host_discovery.set(profile.get("host_discovery", True))
-
+            with open(file, "r", encoding="utf-8") as f:
+                self._apply_profile(json.load(f))
             self._log(f"Profile loaded from {file}", "info")
-            messagebox.showinfo("Success", f"Profile loaded from\n{file}")
+            self._toast(f"Profile loaded: {os.path.basename(file)}", "ok")
         except Exception as e:
             messagebox.showerror("Error", f"Failed to load profile: {e}")
 
+    def _load_settings(self):
+        """Restore the last session's settings (silently ignores a missing/corrupt file)."""
+        try:
+            with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except (OSError, ValueError):
+            return
+        self._apply_profile(data.get("profile", {}))
+        if data.get("db_path"):
+            self.var_db_path.set(data["db_path"])
+        self.var_autosave.set(bool(data.get("autosave", False)))
+        geometry = data.get("geometry")
+        if isinstance(geometry, str) and re.match(r"^\d+x\d+[+-]-?\d+[+-]-?\d+$", geometry):
+            self.geometry(geometry)
+
+    def _save_settings(self):
+        data = {
+            "profile": self._collect_profile(),
+            "db_path": self.var_db_path.get(),
+            "autosave": self.var_autosave.get(),
+            "geometry": self.geometry(),
+        }
+        try:
+            os.makedirs(SETTINGS_DIR, exist_ok=True)
+            with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2)
+        except OSError:
+            pass
+
     def _setup_bindings(self):
         self.bind("<F5>", lambda e: self._start_scan())
+        self.bind("<F6>", lambda e: self._toggle_pause())
         self.bind("<Escape>", lambda e: self._stop_scan())
         self.bind("<Control-e>", lambda e: self._export_menu())
         self.bind("<Control-l>", lambda e: self._clear_results())
-        self.bind("<Control-f>", lambda e: self.entry_filter.focus())
+        self.bind("<Control-f>", lambda e: (self.entry_filter.focus(), "break")[1])
         self.bind("<Control-s>", lambda e: self._save_profile())
         self.bind("<Control-o>", lambda e: self._load_profile())
+        self.bind("<Control-h>", lambda e: self._select_tab(self.tab_history))
+        self.notebook.bind("<<NotebookTabChanged>>", self._on_tab_changed)
+
+    def _on_tab_changed(self, _event=None):
+        try:
+            current = self.notebook.nametowidget(self.notebook.select())
+        except (KeyError, tk.TclError):
+            return
+        if current is self.tab_history:
+            self._refresh_history()
 
     def _on_close(self):
         if self.is_scanning:
@@ -2338,6 +3385,7 @@ class NexScanApp(tk.Tk):
                 return
             if self.scanner:
                 self.scanner.stop()
+        self._save_settings()
         self.destroy()
 
 

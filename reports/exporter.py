@@ -8,11 +8,12 @@ import csv
 import datetime
 import io
 import json
-from typing import List
+import re
+from typing import Callable, Dict, List
 
 from core.scanner import PortState, ScanResult
 
-VERSION = "2.0"
+VERSION = "3.0"
 APP_NAME = "NexScan"
 
 
@@ -84,7 +85,8 @@ def export_xml(results: List[ScanResult]) -> str:
     lines.append(f'<nexscan version="{VERSION}" generated="{datetime.datetime.now().isoformat()}">')
     for r in results:
         lines.append(
-            f'  <host target="{r.target}" ip="{r.ip_address}" hostname="{r.hostname}" up="{r.host_up}">'
+            f'  <host target="{_esc(r.target)}" ip="{_esc(r.ip_address)}" '
+            f'hostname="{_esc(r.hostname)}" up="{r.host_up}">'
         )
         if r.os_guess:
             lines.append(f'    <os guess="{_esc(r.os_guess)}" confidence="{r.os_confidence}"/>')
@@ -97,14 +99,14 @@ def export_xml(results: List[ScanResult]) -> str:
             if p.state == PortState.OPEN:
                 ssl_attr = ""
                 if p.ssl_info:
-                    ssl_attr = f' ssl_version="{p.ssl_info.get("version", "")}"'
+                    ssl_attr = f' ssl_version="{_esc(p.ssl_info.get("version", ""))}"'
                 lines.append(
                     f'      <port number="{p.port}" protocol="{p.protocol}" state="{p.state.value}" '
                     f'service="{_esc(p.service)}" version="{_esc(p.version)}" '
                     f'response_ms="{round(p.response_time*1000,2)}"{ssl_attr}>'
                 )
                 if p.banner:
-                    lines.append(f"        <banner><![CDATA[{p.banner[:200]}]]></banner>")
+                    lines.append(f"        <banner><![CDATA[{_cdata(p.banner[:200])}]]></banner>")
                 lines.append("      </port>")
         lines.append("    </ports>")
         lines.append("  </host>")
@@ -296,12 +298,95 @@ def export_html(results: List[ScanResult]) -> str:
 </html>"""
 
 
+def export_markdown(results: List[ScanResult]) -> str:
+    """GitHub-flavoured Markdown report (handy for tickets, wikis and PRs)."""
+    now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    total_open = sum(r.open_count for r in results)
+    hosts_up = sum(1 for r in results if r.host_up)
+    lines = [
+        f"# {APP_NAME} Scan Report",
+        "",
+        f"_Generated {now} by {APP_NAME} v{VERSION}_",
+        "",
+        "| Hosts scanned | Hosts up | Open ports |",
+        "|---:|---:|---:|",
+        f"| {len(results)} | {hosts_up} | {total_open} |",
+        "",
+    ]
+    for r in results:
+        title = r.target if r.ip_address in ("", r.target) else f"{r.target} ({r.ip_address})"
+        lines.append(f"## {'🟢' if r.host_up else '🔴'} {_md(title)}")
+        meta = [f"**Status:** {'UP' if r.host_up else 'DOWN'}", f"**Scan:** {r.scan_type}"]
+        if r.hostname and r.hostname != r.target:
+            meta.append(f"**rDNS:** {_md(r.hostname)}")
+        if r.os_guess:
+            meta.append(f"**OS:** {_md(r.os_guess)} ({r.os_confidence}%)")
+        meta.append(f"**Duration:** {r.scan_duration:.2f}s")
+        lines.append(" · ".join(meta))
+        lines.append("")
+
+        open_ports = [p for p in r.ports if p.state == PortState.OPEN]
+        if not open_ports:
+            lines.extend(["_No open ports found._", ""])
+            continue
+        lines.append("| Port | Proto | Service | Version | TLS | Banner |")
+        lines.append("|---:|---|---|---|---|---|")
+        for p in open_ports:
+            tls = ""
+            if p.ssl_info:
+                tls = p.ssl_info.get("version", "") or "TLS"
+                if p.ssl_info.get("expired"):
+                    tls += " ⚠ expired"
+            banner = p.banner.splitlines()[0][:60] if p.banner else ""
+            lines.append(
+                f"| {p.port} | {p.protocol} | {_md(p.service)} | {_md(p.version)} | "
+                f"{_md(tls)} | {_md(banner)} |"
+            )
+        lines.append("")
+    lines.append("> For authorized use only.")
+    return "\n".join(lines)
+
+
+_XML_ILLEGAL = re.compile("[\x00-\x08\x0b\x0c\x0e-\x1f\ufffe\uffff]")
+
+
+def _cdata(s: str) -> str:
+    """Make text safe inside a CDATA section."""
+    return _XML_ILLEGAL.sub("", s or "").replace("]]>", "]]]]><![CDATA[>")
+
+
+def _md(s: str) -> str:
+    """Escape text for a Markdown table cell."""
+    return (s or "").replace("|", "\\|").replace("\n", " ").replace("\r", "")
+
+
 def _esc(s: str) -> str:
-    """HTML escape."""
+    """HTML/XML escape (also strips characters that are illegal in XML)."""
     return (
-        (s or "")
+        _XML_ILLEGAL.sub("", s or "")
         .replace("&", "&amp;")
         .replace("<", "&lt;")
         .replace(">", "&gt;")
         .replace('"', "&quot;")
     )
+
+
+# Format key → (exporter, file extension, file-dialog label)
+EXPORTERS: Dict[str, tuple[Callable[[List[ScanResult]], str], str, str]] = {
+    "json": (export_json, ".json", "JSON"),
+    "csv": (export_csv, ".csv", "CSV"),
+    "html": (export_html, ".html", "HTML Report"),
+    "xml": (export_xml, ".xml", "XML"),
+    "md": (export_markdown, ".md", "Markdown"),
+    "txt": (export_txt, ".txt", "Text"),
+}
+
+
+def exporter_for_path(path: str) -> Callable[[List[ScanResult]], str]:
+    """Pick an exporter from a file name's extension (defaults to plain text)."""
+    ext = path.rsplit(".", 1)[-1].lower() if "." in path else ""
+    if ext == "markdown":
+        ext = "md"
+    if ext == "htm":
+        ext = "html"
+    return EXPORTERS.get(ext, EXPORTERS["txt"])[0]

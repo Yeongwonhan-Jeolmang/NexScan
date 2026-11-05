@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "nexscan"
-version = "2.0.0"
+version = "3.0.0"
 description = "Advanced multi-threaded port scanner with a dark terminal-inspired GUI"
 readme = "README.md"
 license = { text = "GPL-3.0-or-later" }
@@ -39,6 +39,8 @@ classifiers = [
 dependencies = []
 
 [project.optional-dependencies]
+# Optional: more robust TLS certificate parsing (stdlib fallback is used otherwise)
+tls = ["cryptography>=41"]
 dev = [
     "pytest>=8.0",
     "pytest-cov>=5.0",
@@ -55,6 +57,9 @@ Homepage = "https://github.com/Yeongwonhan-Jeolmang/NexScan"
 "Bug Tracker" = "https://github.com/Yeongwonhan-Jeolmang/NexScan/issues"
 
 # ── Setuptools package discovery ─────────────────────────────────────
+[tool.setuptools]
+py-modules = ["nexscan"]
+
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["core*", "gui*", "reports*", "utils*", "data*"]

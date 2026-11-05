@@ -199,7 +199,7 @@ def generate_diff_report(diffs: List[HostDiff]) -> str:
     for diff in diffs:
         lines.append(f"  Host: {diff.target} ({diff.ip_address})")
 
-        if diff.status_change:
+        if diff.status_change and diff.status_change != "unchanged":
             icon = (
                 "▲" if diff.status_change == "up" else "▼" if diff.status_change == "down" else "→"
             )

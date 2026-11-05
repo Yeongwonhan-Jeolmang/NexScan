@@ -384,7 +384,8 @@ class ServiceDatabase:
         return results
 
     def get_preset_ports(self, preset_name: str) -> list:
-        return COMMON_PORTS.get(preset_name, [])
+        # De-duplicate while keeping the curated order
+        return list(dict.fromkeys(COMMON_PORTS.get(preset_name, [])))
 
     def get_presets(self) -> list:
         return list(COMMON_PORTS.keys())
