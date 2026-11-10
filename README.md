@@ -41,7 +41,12 @@
 nexscan/
 ├── nexscan.py          # Entry point (GUI + CLI)
 ├── gui/
-│   └── app.py          # Tkinter main window
+│   ├── app.py          # PyQt6 main window
+│   ├── theme.py        # Colour palette, fonts, Qt stylesheet
+│   ├── widgets.py      # Themed building blocks (buttons, sections, text panes, toast)
+│   ├── results_model.py# Table model behind the Results tab
+│   ├── dialogs.py      # Port Detail / About popups
+│   └── assets/         # SVG arrows used by the stylesheet
 ├── core/
 │   ├── scanner.py      # Scanning engine, data classes
 │   ├── raw_scan.py     # Raw-packet SYN/ACK/FIN/XMAS/NULL/Window engine
@@ -71,13 +76,11 @@ nexscan/
 ## Requirements
 
 - Python **3.10+**
-- **tkinter** (bundled with most CPython distributions)
-  - Debian/Ubuntu: `sudo apt-get install python3-tk`
-  - Fedora: `sudo dnf install python3-tkinter`
-  - macOS (Homebrew): `brew install python-tk`
+- **PyQt6** for the GUI — `pip install PyQt6` (installed automatically by `pip install -e .`)
+  - Minimal Linux images may additionally need `libegl1 libxkbcommon0 libxcb-cursor0`
 - Raw socket scans (SYN, ACK, …) require **root / Administrator** privileges.
 
-NexScan has **no required third-party runtime dependencies** — see [`requirements.txt`](requirements.txt) for details.
+The only required third-party runtime dependency is **PyQt6** (for the GUI; the CLI runs without it) — see [`requirements.txt`](requirements.txt) for details.
 Installing the optional [`cryptography`](https://pypi.org/project/cryptography/) package (`pip install -e ".[tls]"`)
 gives the most robust certificate parsing; without it NexScan falls back to the standard library.
 Development tooling (pytest, ruff, black, mypy) is listed in [`requirements-dev.txt`](requirements-dev.txt).

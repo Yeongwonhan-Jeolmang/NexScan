@@ -34,12 +34,10 @@ SCAN_TYPE_CHOICES = ["tcp", "udp", "syn", "ack", "fin", "xmas", "null", "window"
 def launch_gui():
     """Launch the full GUI application"""
     try:
-        import tkinter as tk
-
-        tk.Tk().destroy()  # Quick test
+        from PyQt6 import QtWidgets  # noqa: F401  (quick availability test)
     except Exception as e:
-        print(f"[!] Tkinter not available: {e}", file=sys.stderr)
-        print("    Install: sudo apt-get install python3-tk", file=sys.stderr)
+        print(f"[!] PyQt6 not available: {e}", file=sys.stderr)
+        print("    Install: pip install PyQt6", file=sys.stderr)
         sys.exit(1)
 
     from gui.app import main

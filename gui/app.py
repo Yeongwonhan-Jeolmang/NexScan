@@ -1,7 +1,16 @@
 """
-NexScan GUI — Main Application Window
+NexScan GUI — Main Application Window (PyQt6)
 Dark terminal-inspired professional port scanner interface.
+
+Module layout:
+    gui/theme.py          palette, fonts, Qt stylesheet
+    gui/widgets.py        themed building blocks (buttons, sections, text panes, toast)
+    gui/results_model.py  table model behind the Results tab
+    gui/dialogs.py        Port Detail and About popups
+    gui/app.py            the main window (this file)
 """
+
+from __future__ import annotations
 
 import datetime
 import json
@@ -12,14 +21,45 @@ import socket
 import sys
 import threading
 import time
-import tkinter as tk
 import webbrowser
-from collections import defaultdict
-from tkinter import filedialog, messagebox, ttk
-from tkinter import font as tkfont
+from collections import defaultdict, deque
+from typing import Any, Callable, Optional
 
 # Add parent dir to path (before local imports so `python gui/app.py` works)
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from PyQt6.QtCore import QByteArray, QPoint, Qt, QTimer  # noqa: E402
+from PyQt6.QtGui import QCloseEvent, QColor, QCursor, QKeySequence, QShortcut  # noqa: E402
+from PyQt6.QtWidgets import (  # noqa: E402
+    QAbstractItemView,
+    QApplication,
+    QButtonGroup,
+    QCheckBox,
+    QComboBox,
+    QDoubleSpinBox,
+    QFileDialog,
+    QFrame,
+    QGridLayout,
+    QHeaderView,
+    QLineEdit,
+    QListWidget,
+    QListWidgetItem,
+    QMainWindow,
+    QMenu,
+    QMessageBox,
+    QPlainTextEdit,
+    QProgressBar,
+    QRadioButton,
+    QScrollArea,
+    QSizePolicy,
+    QSpinBox,
+    QSplitter,
+    QTableView,
+    QTabWidget,
+    QTreeWidget,
+    QTreeWidgetItem,
+    QWidget,
+)
 
 from core.scanner import (  # noqa: E402
     RAW_SCAN_TYPES,
@@ -33,68 +73,31 @@ from core.scanner import (  # noqa: E402
     parse_targets,
 )
 from core.service_db import ServiceDatabase  # noqa: E402
-from reports.exporter import EXPORTERS  # noqa: E402
-
-# ─────────────────────────── COLOR PALETTE ───────────────────────────
-C = {
-    "bg": "#0b0e14",
-    "surface": "#111620",
-    "surface2": "#161c2a",
-    "border": "#1e2840",
-    "border2": "#253050",
-    "accent": "#00d4ff",
-    "accent2": "#0099bb",
-    "accent_dim": "#004455",
-    "green": "#00ff88",
-    "green_dim": "#003322",
-    "yellow": "#ffcc00",
-    "yellow_dim": "#332800",
-    "red": "#ff4466",
-    "red_dim": "#330011",
-    "purple": "#bb66ff",
-    "purple_dim": "#220033",
-    "orange": "#ff8822",
-    "text": "#ccd6f6",
-    "text2": "#7888aa",
-    "text3": "#445566",
-    "white": "#e8f0ff",
-    "header_bg": "#0d1220",
-    "row_alt": "#0f1520",
-    "row_hover": "#152030",
-    "select": "#1a3050",
-    "input_bg": "#0d1525",
-    "btn_bg": "#0d1a2e",
-    "btn_hover": "#1a2d48",
-    "tag_open": "#003322",
-    "tag_filt": "#332800",
-    "tag_closed": "#1a1a2a",
-    "row_even": "#111620",
-    "row_odd": "#0e131c",
-    "disabled": "#2a3348",
-}
-
-FONT_MONO = ("Consolas", 10)
-FONT_MONO_SM = ("Consolas", 9)
-FONT_MONO_LG = ("Consolas", 12)
-FONT_MONO_XL = ("Consolas", 14)
-FONT_UI = ("Segoe UI", 10)
-FONT_UI_BOLD = ("Segoe UI", 10, "bold")
-FONT_UI_SM = ("Segoe UI", 9)
-FONT_TITLE = ("Consolas", 16, "bold")
-FONT_STAT = ("Consolas", 22, "bold")
-FONT_TINY = ("Consolas", 8)
-
-_MONO_CANDIDATES = (
-    "Cascadia Mono",
-    "Consolas",
-    "JetBrains Mono",
-    "SF Mono",
-    "Menlo",
-    "DejaVu Sans Mono",
-    "Liberation Mono",
-    "Courier New",
+from gui import dialogs  # noqa: E402
+from gui.results_model import (  # noqa: E402
+    COLUMN_LABELS,
+    COLUMN_WIDTHS,
+    COLUMNS,
+    ResultsModel,
+    row_key,
+    row_values,
 )
-_UI_CANDIDATES = ("Segoe UI", "SF Pro Text", "Helvetica Neue", "Inter", "Cantarell", "DejaVu Sans")
+from gui.theme import C, Fonts, init_fonts, stylesheet  # noqa: E402
+from gui.widgets import (  # noqa: E402
+    FlatButton,
+    Section,
+    StatCard,
+    TaggedText,
+    Toast,
+    frame,
+    hbox,
+    hline,
+    label,
+    set_fg,
+    vbox,
+    vsep,
+)
+from reports.exporter import EXPORTERS  # noqa: E402
 
 # Where the GUI remembers its last-used settings between sessions
 SETTINGS_DIR = os.path.join(
@@ -105,83 +108,30 @@ SETTINGS_DIR = os.path.join(
 )
 SETTINGS_FILE = os.path.join(SETTINGS_DIR, "settings.json")
 
-
-def _init_fonts(root: tk.Misc):
-    """Pick installed font families (Consolas / Segoe UI don't exist on Linux/macOS)."""
-    global FONT_MONO, FONT_MONO_SM, FONT_MONO_LG, FONT_MONO_XL, FONT_UI, FONT_UI_BOLD
-    global FONT_UI_SM, FONT_TITLE, FONT_STAT, FONT_TINY
-    try:
-        families = set(tkfont.families(root))
-    except tk.TclError:
-        return
-    mono = next((f for f in _MONO_CANDIDATES if f in families), "TkFixedFont")
-    ui = next((f for f in _UI_CANDIDATES if f in families), "TkDefaultFont")
-    FONT_MONO = (mono, 10)
-    FONT_MONO_SM = (mono, 9)
-    FONT_MONO_LG = (mono, 12)
-    FONT_MONO_XL = (mono, 14)
-    FONT_UI = (ui, 10)
-    FONT_UI_BOLD = (ui, 10, "bold")
-    FONT_UI_SM = (ui, 9)
-    FONT_TITLE = (mono, 16, "bold")
-    FONT_STAT = (mono, 22, "bold")
-    FONT_TINY = (mono, 8)
+SCAN_TYPES = [
+    "TCP Connect",
+    "UDP",
+    "SYN Stealth*",
+    "ACK*",
+    "FIN*",
+    "XMAS*",
+    "NULL*",
+    "Window*",
+]
 
 
-class _FlatButton(tk.Label):
-    """Flat label-based button with hover, disabled state and keyboard-free styling."""
-
-    def __init__(self, parent, text, command, fg, bg, hover_bg, pad):
-        super().__init__(
-            parent,
-            text=text,
-            font=FONT_MONO_SM,
-            bg=bg,
-            fg=fg,
-            cursor="hand2",
-            padx=pad[0],
-            pady=pad[1],
-        )
-        self._command = command
-        self._fg, self._bg, self._hover_bg = fg, bg, hover_bg
-        self._enabled = True
-        self.bind("<Button-1>", self._on_click)
-        self.bind("<Enter>", lambda e: self._enabled and self.configure(bg=self._hover_bg))
-        self.bind("<Leave>", lambda e: self.configure(bg=self._bg))
-
-    def _on_click(self, _event=None):
-        if self._enabled:
-            self._command()
-
-    def set_enabled(self, enabled: bool):
-        self._enabled = enabled
-        self.configure(
-            fg=self._fg if enabled else C["disabled"],
-            cursor="hand2" if enabled else "arrow",
-            bg=self._bg,
-        )
-
-    def set_text(self, text: str, fg: str = ""):
-        if fg:
-            self._fg = fg
-        self.configure(text=text, fg=self._fg if self._enabled else C["disabled"])
-
-
-class NexScanApp(tk.Tk):
+class NexScanApp(QMainWindow):
     VERSION = "3.0"
 
     def __init__(self):
         super().__init__()
-        self.title(f"NexScan v{self.VERSION} — Advanced Port Scanner")
-        self.configure(bg=C["bg"])
-        self.geometry("1400x900")
-        self.minsize(1100, 700)
+        self.setWindowTitle(f"NexScan v{self.VERSION} — Advanced Port Scanner")
+        self.resize(1400, 900)
+        self.setMinimumSize(1100, 700)
 
         # Queue for thread-safe UI updates (created first: widgets may log during build)
         self._ui_queue: queue.Queue = queue.Queue()
 
-        _init_fonts(self)
-        self._setup_style()
         self._init_state()
         self._build_ui()
         self._setup_bindings()
@@ -189,283 +139,44 @@ class NexScanApp(tk.Tk):
         self._count_ports()
         self._count_targets()
 
-        self._poll_queue()
+        self._poll_timer = QTimer(self)
+        self._poll_timer.timeout.connect(self._poll_queue)
+        self._poll_timer.start(30)
 
-        self.protocol("WM_DELETE_WINDOW", self._on_close)
-
-    def _setup_style(self):
-        style = ttk.Style(self)
-        style.theme_use("clam")
-
-        # Base defaults so no widget falls back to clam's light bevels
-        style.configure(
-            ".",
-            background=C["surface2"],
-            foreground=C["text"],
-            bordercolor=C["border2"],
-            darkcolor=C["surface2"],
-            lightcolor=C["surface2"],
-            troughcolor=C["bg"],
-            focuscolor=C["accent2"],
-            selectbackground=C["select"],
-            selectforeground=C["white"],
-            insertcolor=C["accent"],
-            font=FONT_MONO_SM,
-        )
-
-        # Treeview
-        style.configure(
-            "Treeview",
-            background=C["surface"],
-            foreground=C["text"],
-            fieldbackground=C["surface"],
-            borderwidth=0,
-            rowheight=26,
-            font=FONT_MONO_SM,
-        )
-        style.configure(
-            "Treeview.Heading",
-            background=C["header_bg"],
-            foreground=C["accent"],
-            borderwidth=0,
-            relief="flat",
-            font=FONT_MONO_SM,
-            padding=(6, 5),
-        )
-        style.map(
-            "Treeview",
-            background=[("selected", C["select"])],
-            foreground=[("selected", C["white"])],
-        )
-        style.map(
-            "Treeview.Heading",
-            background=[("active", C["border"])],
-            foreground=[("active", C["white"])],
-        )
-        style.layout("Treeview", [("Treeview.treearea", {"sticky": "nswe"})])
-
-        # Scrollbars — slim, borderless, highlight on hover
-        for orient in ("Vertical", "Horizontal"):
-            style.configure(
-                f"{orient}.TScrollbar",
-                background=C["border2"],
-                troughcolor=C["bg"],
-                bordercolor=C["bg"],
-                darkcolor=C["border2"],
-                lightcolor=C["border2"],
-                arrowcolor=C["text3"],
-                borderwidth=0,
-                arrowsize=10,
-                width=10,
-                gripcount=0,
-            )
-            style.map(
-                f"{orient}.TScrollbar",
-                background=[("active", C["accent2"]), ("pressed", C["accent"])],
-                arrowcolor=[("active", C["accent"])],
-            )
-
-        # Progressbar
-        style.configure(
-            "Scan.Horizontal.TProgressbar",
-            background=C["accent"],
-            troughcolor=C["surface2"],
-            bordercolor=C["surface2"],
-            darkcolor=C["accent"],
-            lightcolor=C["accent"],
-            borderwidth=0,
-            thickness=8,
-        )
-
-        # Notebook tabs
-        style.configure("TNotebook", background=C["bg"], borderwidth=0, tabmargins=(0, 4, 0, 0))
-        style.configure(
-            "TNotebook.Tab",
-            background=C["surface2"],
-            foreground=C["text2"],
-            padding=[14, 7],
-            font=FONT_MONO_SM,
-            borderwidth=0,
-            bordercolor=C["bg"],
-            lightcolor=C["surface2"],
-        )
-        style.map(
-            "TNotebook.Tab",
-            background=[("selected", C["surface"]), ("active", C["border"])],
-            foreground=[("selected", C["accent"]), ("active", C["text"])],
-            lightcolor=[("selected", C["accent"])],
-            expand=[("selected", (0, 2, 0, 0))],
-        )
-        # Settings notebook inside the left panel sits on surface2
-        style.configure("Inner.TNotebook", background=C["surface2"], borderwidth=0)
-        style.configure(
-            "Inner.TNotebook.Tab",
-            background=C["input_bg"],
-            foreground=C["text2"],
-            padding=[10, 5],
-            font=FONT_MONO_SM,
-            borderwidth=0,
-            bordercolor=C["surface2"],
-            lightcolor=C["input_bg"],
-        )
-        style.map(
-            "Inner.TNotebook.Tab",
-            background=[("selected", C["surface2"]), ("active", C["border"])],
-            foreground=[("selected", C["accent"]), ("active", C["text"])],
-            lightcolor=[("selected", C["accent"])],
-        )
-
-        # Separators
-        style.configure("TSeparator", background=C["border"])
-
-        # Combobox (+ its popdown listbox, which is a plain Tk widget)
-        style.configure(
-            "TCombobox",
-            fieldbackground=C["input_bg"],
-            background=C["btn_bg"],
-            foreground=C["text"],
-            selectbackground=C["input_bg"],
-            selectforeground=C["text"],
-            bordercolor=C["border2"],
-            darkcolor=C["input_bg"],
-            lightcolor=C["input_bg"],
-            arrowcolor=C["accent"],
-            arrowsize=12,
-            padding=(4, 2),
-        )
-        style.map(
-            "TCombobox",
-            fieldbackground=[("readonly", C["input_bg"])],
-            foreground=[("readonly", C["text"])],
-            background=[("active", C["btn_hover"]), ("readonly", C["btn_bg"])],
-            bordercolor=[("focus", C["accent2"])],
-        )
-        self.option_add("*TCombobox*Listbox.background", C["surface2"])
-        self.option_add("*TCombobox*Listbox.foreground", C["text"])
-        self.option_add("*TCombobox*Listbox.selectBackground", C["select"])
-        self.option_add("*TCombobox*Listbox.selectForeground", C["white"])
-        self.option_add("*TCombobox*Listbox.font", FONT_MONO_SM)
-        self.option_add("*TCombobox*Listbox.borderWidth", 0)
-
-        # Spinbox
-        style.configure(
-            "TSpinbox",
-            fieldbackground=C["input_bg"],
-            background=C["btn_bg"],
-            foreground=C["text"],
-            bordercolor=C["border2"],
-            darkcolor=C["input_bg"],
-            lightcolor=C["input_bg"],
-            arrowcolor=C["accent"],
-            arrowsize=10,
-            padding=(4, 1),
-        )
-        style.map(
-            "TSpinbox",
-            background=[("active", C["btn_hover"])],
-            bordercolor=[("focus", C["accent2"])],
-        )
-
-        # Checkbutton
-        style.configure(
-            "TCheckbutton",
-            background=C["surface2"],
-            foreground=C["text"],
-            focuscolor=C["surface2"],
-            indicatorbackground=C["input_bg"],
-            indicatorforeground=C["accent"],
-            indicatorrelief="flat",
-            indicatormargin=(0, 0, 6, 0),
-            padding=(2, 2),
-        )
-        style.map(
-            "TCheckbutton",
-            background=[("active", C["surface2"])],
-            foreground=[("active", C["white"]), ("disabled", C["text3"])],
-            indicatorbackground=[("selected", C["accent_dim"]), ("active", C["btn_hover"])],
-        )
-        # Variant for toolbars on the darker surface colour
-        style.configure("Bar.TCheckbutton", background=C["surface"])
-        style.map("Bar.TCheckbutton", background=[("active", C["surface"])])
-
-        # Labelframe
-        style.configure(
-            "Card.TLabelframe",
-            background=C["surface2"],
-            foreground=C["accent"],
-            bordercolor=C["border2"],
-            relief="solid",
-            borderwidth=1,
-        )
-        style.configure(
-            "Card.TLabelframe.Label",
-            background=C["surface2"],
-            foreground=C["accent"],
-            font=FONT_MONO_SM,
-        )
+    # ─────────────────────────── STATE ───────────────────────────
 
     def _init_state(self):
         self.service_db = ServiceDatabase()
-        self.scanner: PortScanner = None
-        self.scan_thread: threading.Thread = None
+        self.scanner: Optional[PortScanner] = None
+        self.scan_thread: Optional[threading.Thread] = None
         self.scan_results: list[ScanResult] = []
         self.is_scanning = False
         self.is_paused = False
-        self.scan_start_time = None
-        self.filtered_results = []
+        self.scan_start_time: Optional[float] = None
         self._paused_total = 0.0
-        self._pause_started = None
+        self._pause_started: Optional[float] = None
 
-        # Live row store: (target, proto, port) -> (target, PortResult). Filled while the
+        # Live row store: "target|proto|port" -> (target, PortResult). Filled while the
         # scan runs so filtering / sorting works before the scan completes.
         self._rows: dict = {}
-        self._live_counts: dict = {}  # target -> {"open": n, "filtered": n}
-        self._header_sort = None  # (column, descending) when sorted via a heading click
-        self._refresh_job = None
-        self._row_counter = 0
+        self._live_counts: dict = {}  # target -> {"open": n, "filtered": n, "up": n}
+        self._header_sort: Optional[tuple[str, bool]] = None  # (column, descending)
         self._vuln_busy = False
         self._raw_ok, self._raw_reason = self._detect_raw_support()
+        self._log_entries: deque = deque(maxlen=self._LOG_MAX_LINES)
+        self._log_level = "All"
+        self._db_path = os.path.abspath("nexscan_history.db")
+        self._popups: list = []  # keep references so non-modal dialogs aren't GC'd
 
-        # Live scan stats
-        self.stat_open = tk.IntVar(value=0)
-        self.stat_filtered = tk.IntVar(value=0)
-        self.stat_hosts_up = tk.IntVar(value=0)
-        self.stat_ports_done = tk.IntVar(value=0)
-        self.stat_total_ports = tk.IntVar(value=0)
-        self.stat_eta = tk.StringVar(value="—")
-
-        # Settings vars
-        self.var_scan_type = tk.StringVar(value="TCP Connect")
-        self.var_threads = tk.IntVar(value=300)
-        self.var_timeout = tk.DoubleVar(value=1.5)
-        self.var_connect_timeout = tk.DoubleVar(value=3.0)
-        self.var_banner_grab = tk.BooleanVar(value=True)
-        self.var_service_detect = tk.BooleanVar(value=True)
-        self.var_os_detect = tk.BooleanVar(value=False)
-        self.var_ssl_probe = tk.BooleanVar(value=True)
-        self.var_host_discovery = tk.BooleanVar(value=True)
-        self.var_rate_limit = tk.DoubleVar(value=0.0)
-        self.var_retry = tk.IntVar(value=1)
-        self.var_show_closed = tk.BooleanVar(value=False)
-        self.var_show_filtered = tk.BooleanVar(value=True)
-        self.var_port_preset = tk.StringVar(value="Top 100")
-        self.var_sort_col = tk.StringVar(value="port")
-        self.var_filter_text = tk.StringVar()
-        self.var_filter_text.trace_add("write", self._apply_filter)
-        self.var_filter_regex = tk.BooleanVar(value=False)
-        self.var_filter_regex.trace_add("write", self._apply_filter)
-        self.var_show_closed.trace_add("write", self._apply_filter)
-        self.var_show_filtered.trace_add("write", self._apply_filter)
-
-        # Advanced settings (created here so profiles / settings can always reach them)
-        self.var_jitter = tk.DoubleVar(value=0.0)
-        self.var_max_banner = tk.DoubleVar(value=2.0)
-        self.var_udp_probes = tk.BooleanVar(value=True)
-        self.var_quick_resolve = tk.BooleanVar(value=True)
-
-        # History
-        self.var_db_path = tk.StringVar(value=os.path.abspath("nexscan_history.db"))
-        self.var_autosave = tk.BooleanVar(value=False)
+        # Debounce timers
+        self._refresh_timer = QTimer(self)
+        self._refresh_timer.setSingleShot(True)
+        self._refresh_timer.timeout.connect(self._refresh_results_view)
+        self._stats_timer = QTimer(self)
+        self._stats_timer.setSingleShot(True)
+        self._stats_timer.timeout.connect(self._update_stats_tab)
+        self._elapsed_timer = QTimer(self)
+        self._elapsed_timer.timeout.connect(self._update_timer)
 
     @staticmethod
     def _detect_raw_support() -> tuple[bool, str]:
@@ -476,72 +187,67 @@ class NexScanApp(tk.Tk):
         except Exception as e:
             return False, str(e)
 
+    # ─────────────────────────── BUILD UI ───────────────────────────
+
     def _build_ui(self):
-        # ── Top bar ──
-        self._build_topbar()
-        # ── Status bar (packed before the expanding main area so it keeps its space) ──
-        self._build_statusbar()
-        # ── Main paned layout ──
-        self._build_main()
+        central = frame("bg")
+        self.setCentralWidget(central)
+        root = vbox(central)
+
+        root.addWidget(self._build_topbar())
+        root.addWidget(self._build_main(), 1)
+        root.addWidget(hline())
+        root.addWidget(self._build_statusbar())
+
+        self._toast_widget = Toast(self)
         self._update_controls()
 
-    def _build_topbar(self):
-        bar = tk.Frame(self, bg=C["header_bg"], height=52)
-        bar.pack(fill="x", side="top")
-        bar.pack_propagate(False)
+    def _build_topbar(self) -> QWidget:
+        bar = frame("topbar")
+        bar.setFixedHeight(52)
+        lay = hbox(bar, margins=(20, 10, 12, 10), spacing=8)
 
-        # Logo
-        logo = tk.Label(bar, text="◈ NEXSCAN", font=FONT_TITLE, bg=C["header_bg"], fg=C["accent"])
-        logo.pack(side="left", padx=20, pady=10)
-
-        ver = tk.Label(
-            bar, text=f"v{self.VERSION}", font=FONT_MONO_SM, bg=C["header_bg"], fg=C["text3"]
-        )
-        ver.pack(side="left", pady=10)
-
-        # Separator
-        sep = tk.Frame(bar, bg=C["border"], width=1)
-        sep.pack(side="left", fill="y", padx=20, pady=10)
+        lay.addWidget(label("◈ NEXSCAN", C["accent"], Fonts.title()))
+        lay.addWidget(label(f"v{self.VERSION}", C["text3"], Fonts.mono_sm()))
+        lay.addSpacing(12)
+        lay.addWidget(vsep())
+        lay.addSpacing(12)
 
         # Quick action buttons (kept so their state can follow the scan)
         self.btn_start = self._make_button(
-            bar, "▶  START SCAN", self._start_scan, fg=C["green"], pad=(14, 6)
+            "▶  START SCAN", self._start_scan, fg=C["green"], pad=(14, 6)
         )
         self.btn_pause = self._make_button(
-            bar, "⏸  PAUSE", self._toggle_pause, fg=C["yellow"], pad=(14, 6)
+            "⏸  PAUSE", self._toggle_pause, fg=C["yellow"], pad=(14, 6)
         )
-        self.btn_stop = self._make_button(bar, "■  STOP", self._stop_scan, fg=C["red"], pad=(14, 6))
+        self.btn_stop = self._make_button("■  STOP", self._stop_scan, fg=C["red"], pad=(14, 6))
         self.btn_clear = self._make_button(
-            bar, "⟳  CLEAR", self._clear_results, fg=C["text2"], pad=(14, 6)
+            "⟳  CLEAR", self._clear_results, fg=C["text2"], pad=(14, 6)
         )
         for btn in (self.btn_start, self.btn_pause, self.btn_stop, self.btn_clear):
-            btn.pack(side="left", padx=4, pady=10)
+            lay.addWidget(btn)
 
-        # Right side: export + settings
-        tk.Frame(bar, bg=C["header_bg"]).pack(side="left", fill="x", expand=True)
+        lay.addStretch(1)
+
+        # Scan elapsed timer
+        self.lbl_timer_icon = label("⏱", C["text3"], Fonts.mono_sm())
+        lay.addWidget(self.lbl_timer_icon)
+        self.lbl_timer = label("00:00:00", C["text3"], Fonts.mono_lg())
+        lay.addWidget(self.lbl_timer)
+        lay.addSpacing(16)
 
         for text, cmd, fg in [
-            ("✦  ABOUT", self._show_about, C["text2"]),
-            ("⬇  EXPORT", self._export_menu, C["purple"]),
             ("◷  HISTORY", lambda: self._select_tab(self.tab_history), C["accent"]),
+            ("⬇  EXPORT", self._export_menu, C["purple"]),
+            ("✦  ABOUT", self._show_about, C["text2"]),
         ]:
-            btn = self._make_button(bar, text, cmd, fg=fg, pad=(14, 6))
-            btn.pack(side="right", padx=4, pady=10)
+            lay.addWidget(self._make_button(text, cmd, fg=fg, pad=(14, 6)))
+        return bar
 
-        # Scan elapsed timer label
-        self.lbl_timer = tk.Label(
-            bar, text="00:00:00", font=FONT_MONO_LG, bg=C["header_bg"], fg=C["text3"]
-        )
-        self.lbl_timer.pack(side="right", padx=16)
-        self.lbl_timer_icon = tk.Label(
-            bar, text="⏱", font=FONT_MONO_SM, bg=C["header_bg"], fg=C["text3"]
-        )
-        self.lbl_timer_icon.pack(side="right")
-
-    def _select_tab(self, tab):
+    def _select_tab(self, tab: QWidget):
         try:
-            self.notebook.select(tab)
-        except (tk.TclError, AttributeError):
+            self.notebook.setCurrentWidget(tab)
+        except AttributeError:
             pass
 
     def _update_controls(self):
@@ -556,215 +262,155 @@ class NexScanApp(tk.Tk):
         else:
             self.btn_pause.set_text("⏸  PAUSE", fg=C["yellow"])
 
-    def _build_main(self):
-        main = tk.PanedWindow(
-            self, orient="horizontal", bg=C["border"], sashwidth=4, sashrelief="flat", handlesize=0
-        )
-        main.pack(fill="both", expand=True, padx=0, pady=0)
+    def _build_main(self) -> QWidget:
+        main = QSplitter(Qt.Orientation.Horizontal)
+        main.setHandleWidth(4)
+        main.setChildrenCollapsible(False)
 
-        # Left panel
-        left = self._build_left_panel(main)
-        main.add(left, minsize=320, width=360)
+        left = self._build_left_panel()
+        left.setMinimumWidth(320)
+        main.addWidget(left)
 
-        # Right panel (tabbed)
-        right = self._build_right_panel(main)
-        main.add(right, minsize=600)
+        right = self._build_right_panel()
+        right.setMinimumWidth(600)
+        main.addWidget(right)
 
-    def _build_left_panel(self, parent):
+        main.setStretchFactor(0, 0)
+        main.setStretchFactor(1, 1)
+        main.setSizes([360, 1040])
+        self.main_splitter = main
+        return main
+
+    # ── Left panel ──
+
+    def _build_left_panel(self) -> QWidget:
         # Scrollable container: the settings column is taller than small screens
-        outer = tk.Frame(parent, bg=C["surface"])
-        canvas = tk.Canvas(outer, bg=C["surface"], highlightthickness=0, bd=0)
-        vsb = ttk.Scrollbar(outer, orient="vertical", command=canvas.yview)
-        canvas.configure(yscrollcommand=vsb.set)
-        vsb.pack(side="right", fill="y")
-        canvas.pack(side="left", fill="both", expand=True)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
 
-        frame = tk.Frame(canvas, bg=C["surface"])
-        win = canvas.create_window((0, 0), window=frame, anchor="nw")
-        frame.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
-        canvas.bind("<Configure>", lambda e: canvas.itemconfigure(win, width=e.width))
-        self._bind_mousewheel(outer, canvas)
+        content = QWidget()
+        content.setObjectName("leftContent")
+        content.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        content.setStyleSheet(f"QWidget#leftContent {{ background: {C['surface']}; }}")
+        col = vbox(content, margins=(4, 3, 4, 3), spacing=6)
+        scroll.setWidget(content)
 
         # ── Target input ──
-        sec = self._section(frame, "TARGET")
-        self.txt_targets = tk.Text(
-            sec,
-            height=4,
-            bg=C["input_bg"],
-            fg=C["text"],
-            font=FONT_MONO_SM,
-            insertbackground=C["accent"],
-            relief="flat",
-            bd=0,
-            highlightthickness=1,
-            highlightcolor=C["accent2"],
-            highlightbackground=C["border2"],
-            wrap="none",
-            padx=6,
-            pady=6,
+        sec = Section("TARGET")
+        self.txt_targets = self._make_input(lines=4)
+        self.txt_targets.setPlainText("192.168.1.1")
+        self.txt_targets.textChanged.connect(self._count_targets)
+        sec.body.addWidget(self.txt_targets)
+        self.lbl_target_summary = label(
+            "IP, range (192.168.1.1-50), CIDR, or hostname — one per line or comma-separated",
+            C["text3"],
+            Fonts.tiny(),
+            wrap=True,
         )
-        self.txt_targets.insert("1.0", "192.168.1.1")
-        self.txt_targets.pack(fill="x", padx=8, pady=(0, 6))
-
-        self.txt_targets.bind("<KeyRelease>", lambda e: self._count_targets())
-
-        self.lbl_target_summary = tk.Label(
-            sec,
-            text="IP, range (192.168.1.1-50), CIDR, or hostname — one per line or comma-separated",
-            bg=C["surface2"],
-            fg=C["text3"],
-            font=FONT_TINY,
-            wraplength=300,
-            justify="left",
-            anchor="w",
-        )
-        self.lbl_target_summary.pack(fill="x", padx=8, pady=(0, 6))
+        sec.body.addWidget(self.lbl_target_summary)
+        col.addWidget(sec)
 
         # ── Port config ──
-        sec2 = self._section(frame, "PORTS")
-
-        # Preset selector
-        prow = tk.Frame(sec2, bg=C["surface2"])
-        prow.pack(fill="x", padx=8, pady=(0, 4))
-        tk.Label(prow, text="Preset:", bg=C["surface2"], fg=C["text2"], font=FONT_MONO_SM).pack(
-            side="left"
+        sec2 = Section("PORTS")
+        prow = hbox(spacing=6)
+        prow.addWidget(label("Preset:", C["text2"]))
+        self.cb_preset = QComboBox()
+        self.cb_preset.addItems(self.service_db.get_presets())
+        self.cb_preset.setCurrentText("Top 100")
+        self.cb_preset.setMinimumContentsLength(18)
+        self.cb_preset.activated.connect(lambda _i: self._apply_port_preset())
+        prow.addWidget(self.cb_preset)
+        prow.addWidget(
+            self._make_button("Apply", self._apply_port_preset, fg=C["accent"], pad=(8, 2))
         )
-        presets = self.service_db.get_presets()
-        cb = ttk.Combobox(
-            prow,
-            textvariable=self.var_port_preset,
-            values=presets,
-            state="readonly",
-            width=18,
-            font=FONT_MONO_SM,
-        )
-        cb.pack(side="left", padx=6)
-        cb.bind("<<ComboboxSelected>>", self._apply_port_preset)
+        prow.addStretch(1)
+        sec2.body.addLayout(prow)
 
-        self._make_button(
-            prow,
-            "Apply",
-            self._apply_port_preset,
-            fg=C["accent"],
-            bg=C["btn_bg"],
-            hover_bg=C["btn_hover"],
-            pad=(8, 2),
-        ).pack(side="left", padx=4)
-
-        tk.Label(
-            sec2, text="Port range / list:", bg=C["surface2"], fg=C["text2"], font=FONT_MONO_SM
-        ).pack(anchor="w", padx=8)
-
-        self.txt_ports = tk.Text(
-            sec2,
-            height=3,
-            bg=C["input_bg"],
-            fg=C["text"],
-            font=FONT_MONO_SM,
-            insertbackground=C["accent"],
-            relief="flat",
-            bd=0,
-            highlightthickness=1,
-            highlightcolor=C["accent2"],
-            highlightbackground=C["border2"],
-            wrap="none",
-            padx=6,
-            pady=6,
+        sec2.body.addWidget(label("Port range / list:", C["text2"]))
+        self.txt_ports = self._make_input(lines=3)
+        self.txt_ports.setPlainText(
+            "21,22,23,25,53,80,110,135,139,143,443,445,993,995,1433,1521,3306,3389,5432,5900,8080,8443,27017"
         )
-        self.txt_ports.insert(
-            "1.0",
-            "21,22,23,25,53,80,110,135,139,143,443,445,993,995,1433,1521,3306,3389,5432,5900,8080,8443,27017",
+        self.txt_ports.textChanged.connect(self._count_ports)
+        sec2.body.addWidget(self.txt_ports)
+        self.lbl_port_summary = label(
+            "e.g.: 22,80,443  or  1-1024  or  80,443,8000-9000", C["text3"], Fonts.tiny()
         )
-        self.txt_ports.pack(fill="x", padx=8, pady=(2, 6))
-        self.txt_ports.bind("<KeyRelease>", lambda e: self._count_ports())
-
-        self.lbl_port_summary = tk.Label(
-            sec2,
-            text="e.g.: 22,80,443  or  1-1024  or  80,443,8000-9000",
-            bg=C["surface2"],
-            fg=C["text3"],
-            font=FONT_TINY,
-            anchor="w",
-        )
-        self.lbl_port_summary.pack(fill="x", padx=8, pady=(0, 6))
+        sec2.body.addWidget(self.lbl_port_summary)
+        col.addWidget(sec2)
 
         # ── Scan Type ──
-        sec3 = self._section(frame, "SCAN TYPE")
-        scan_types = [
-            "TCP Connect",
-            "UDP",
-            "SYN Stealth*",
-            "ACK*",
-            "FIN*",
-            "XMAS*",
-            "NULL*",
-            "Window*",
-        ]
-        grid = tk.Frame(sec3, bg=C["surface2"])
-        grid.pack(fill="x", padx=6, pady=(2, 0))
-        for i, st in enumerate(scan_types):
+        sec3 = Section("SCAN TYPE")
+        grid = QGridLayout()
+        grid.setContentsMargins(0, 0, 0, 0)
+        grid.setHorizontalSpacing(8)
+        grid.setVerticalSpacing(2)
+        self.scan_type_group = QButtonGroup(self)
+        self.scan_type_group.setExclusive(True)
+        self._scan_type_buttons: dict[str, QRadioButton] = {}
+        for i, st in enumerate(SCAN_TYPES):
             needs_root = st.endswith("*")
             usable = self._raw_ok or not needs_root
-            rb = tk.Radiobutton(
-                grid,
-                text=st,
-                variable=self.var_scan_type,
-                value=st,
-                bg=C["surface2"],
-                fg=C["text"] if not needs_root else C["text2"],
-                disabledforeground=C["disabled"],
-                selectcolor=C["input_bg"],
-                activebackground=C["surface2"],
-                activeforeground=C["white"],
-                font=FONT_MONO_SM,
-                cursor="hand2" if usable else "arrow",
-                indicatoron=True,
-                highlightthickness=0,
-                bd=0,
-                state="normal" if usable else "disabled",
+            rb = QRadioButton(st)
+            rb.setEnabled(usable)
+            rb.setCursor(
+                Qt.CursorShape.PointingHandCursor if usable else Qt.CursorShape.ArrowCursor
             )
-            rb.grid(row=i // 2, column=i % 2, sticky="w", padx=4, pady=2)
-        grid.columnconfigure(0, weight=1)
-        grid.columnconfigure(1, weight=1)
-
-        self.lbl_scan_hint = tk.Label(
-            sec3,
-            text="",
-            bg=C["surface2"],
-            fg=C["text2"],
-            font=FONT_TINY,
-            wraplength=300,
-            justify="left",
-            anchor="w",
+            if needs_root:
+                rb.setStyleSheet(
+                    f"QRadioButton {{ color: {C['text2']}; }}"
+                    f" QRadioButton:hover {{ color: {C['white']}; }}"
+                    f" QRadioButton:disabled {{ color: {C['disabled']}; }}"
+                )
+            self.scan_type_group.addButton(rb, i)
+            self._scan_type_buttons[st] = rb
+            grid.addWidget(rb, i // 2, i % 2)
+        self._scan_type_buttons["TCP Connect"].setChecked(True)
+        self.scan_type_group.buttonToggled.connect(
+            lambda _b, checked: checked and self._update_scan_type_hint()
         )
-        self.lbl_scan_hint.pack(fill="x", padx=8, pady=(4, 0))
+        sec3.body.addLayout(grid)
+
+        self.lbl_scan_hint = label("", C["text2"], Fonts.tiny(), wrap=True)
+        sec3.body.addWidget(self.lbl_scan_hint)
         root_note = (
             "* Raw packet scans — privileges OK"
             if self._raw_ok
             else f"* Unavailable: {self._raw_reason}"
         )
-        tk.Label(
-            sec3,
-            text=root_note,
-            bg=C["surface2"],
-            fg=C["green"] if self._raw_ok else C["text3"],
-            font=FONT_TINY,
-            wraplength=300,
-            justify="left",
-        ).pack(anchor="w", padx=8, pady=(2, 6))
-        self.var_scan_type.trace_add("write", lambda *a: self._update_scan_type_hint())
+        sec3.body.addWidget(
+            label(root_note, C["green"] if self._raw_ok else C["text3"], Fonts.tiny(), wrap=True)
+        )
         self._update_scan_type_hint()
+        col.addWidget(sec3)
 
         # ── Settings tabs ──
-        sec4 = self._section(frame, "SETTINGS")
-        nb = ttk.Notebook(sec4, style="Inner.TNotebook")
-        nb.pack(fill="both", expand=True, padx=6, pady=4)
-
+        sec4 = Section("SETTINGS")
+        nb = QTabWidget()
+        nb.setObjectName("inner")
+        nb.setDocumentMode(True)
         self._build_perf_tab(nb)
         self._build_output_tab(nb)
         self._build_advanced_tab(nb)
+        sec4.body.addWidget(nb)
+        col.addWidget(sec4)
 
-        return outer
+        col.addStretch(1)
+        return scroll
+
+    def _make_input(self, lines: int) -> QPlainTextEdit:
+        box = QPlainTextEdit()
+        box.setObjectName("input")
+        box.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
+        box.setFont(Fonts.mono_sm())
+        box.setTabChangesFocus(True)
+        box.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        box.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        fm = box.fontMetrics()
+        box.setFixedHeight(fm.lineSpacing() * lines + 18)
+        return box
 
     _SCAN_TYPE_HINTS = {
         "TCP Connect": "Full 3-way handshake. Works unprivileged; enables banners & TLS info.",
@@ -777,561 +423,386 @@ class NexScanApp(tk.Tk):
         "Window*": "ACK probe reading the RST window size (open on some BSD-derived stacks).",
     }
 
+    def _scan_type(self) -> str:
+        btn = self.scan_type_group.checkedButton()
+        return btn.text() if btn else "TCP Connect"
+
+    def _set_scan_type(self, value: str):
+        btn = self._scan_type_buttons.get(str(value))
+        if btn is not None and btn.isEnabled():
+            btn.setChecked(True)
+        else:
+            self._scan_type_buttons["TCP Connect"].setChecked(True)
+
     def _update_scan_type_hint(self):
         if hasattr(self, "lbl_scan_hint"):
-            self.lbl_scan_hint.configure(
-                text=self._SCAN_TYPE_HINTS.get(self.var_scan_type.get(), "")
+            self.lbl_scan_hint.setText(self._SCAN_TYPE_HINTS.get(self._scan_type(), ""))
+
+    def _settings_page(self, notebook: QTabWidget, title: str):
+        page = QWidget()
+        page.setObjectName("innerPage")
+        page.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        lay = vbox(page, margins=(4, 6, 4, 6), spacing=4)
+        notebook.addTab(page, title)
+        return lay
+
+    def _spin_row(self, lay, text: str, spin: QWidget, hint: str = "", label_chars: int = 20):
+        row = hbox(spacing=6)
+        lbl = label(text, C["text2"])
+        lbl.setFixedWidth(lbl.fontMetrics().horizontalAdvance("x" * label_chars))
+        row.addWidget(lbl)
+        spin.setFixedWidth(spin.fontMetrics().horizontalAdvance("0" * 8) + 34)
+        row.addWidget(spin)
+        if hint:
+            row.addWidget(label(hint, C["text3"], Fonts.tiny()))
+        row.addStretch(1)
+        lay.addLayout(row)
+
+    @staticmethod
+    def _int_spin(lo: int, hi: int, value: int, step: int = 1) -> QSpinBox:
+        sp = QSpinBox()
+        sp.setRange(lo, hi)
+        sp.setSingleStep(step)
+        sp.setValue(value)
+        return sp
+
+    @staticmethod
+    def _float_spin(lo: float, hi: float, value: float, step: float = 0.1) -> QDoubleSpinBox:
+        sp = QDoubleSpinBox()
+        sp.setDecimals(2)
+        sp.setRange(lo, hi)
+        sp.setSingleStep(step)
+        sp.setValue(value)
+        return sp
+
+    def _build_perf_tab(self, notebook: QTabWidget):
+        lay = self._settings_page(notebook, "Performance")
+        self.sp_threads = self._int_spin(1, 1000, 300)
+        self.sp_timeout = self._float_spin(0.1, 30.0, 1.5)
+        self.sp_connect_timeout = self._float_spin(0.5, 60.0, 3.0)
+        self.sp_rate_limit = self._float_spin(0.0, 5000.0, 0.0)
+        self.sp_retry = self._int_spin(1, 5, 1)
+        for text, spin, hint in [
+            ("Threads", self.sp_threads, ""),
+            ("Reply Timeout (s)", self.sp_timeout, "UDP/raw"),
+            ("Connect Timeout (s)", self.sp_connect_timeout, "TCP"),
+            ("Rate Limit (ms)", self.sp_rate_limit, "0=off"),
+            ("Probe Attempts", self.sp_retry, "UDP/raw"),
+        ]:
+            self._spin_row(lay, text, spin, hint, label_chars=19)
+        lay.addStretch(1)
+
+    def _build_output_tab(self, notebook: QTabWidget):
+        lay = self._settings_page(notebook, "Detection")
+        self.chk_banner_grab = QCheckBox("Banner Grabbing")
+        self.chk_service_detect = QCheckBox("Service Detection")
+        self.chk_os_detect = QCheckBox("OS Detection (heuristic)")
+        self.chk_ssl_probe = QCheckBox("SSL/TLS Probing")
+        self.chk_host_discovery = QCheckBox("Host Discovery")
+        self.chk_show_filtered = QCheckBox("Show Filtered Ports")
+        self.chk_show_closed = QCheckBox("Show Closed Ports")
+        for chk, default in [
+            (self.chk_banner_grab, True),
+            (self.chk_service_detect, True),
+            (self.chk_os_detect, False),
+            (self.chk_ssl_probe, True),
+            (self.chk_host_discovery, True),
+            (self.chk_show_filtered, True),
+            (self.chk_show_closed, False),
+        ]:
+            chk.setChecked(default)
+            lay.addWidget(chk)
+        self.chk_show_filtered.toggled.connect(lambda _c: self._apply_filter())
+        self.chk_show_closed.toggled.connect(lambda _c: self._apply_filter())
+        lay.addStretch(1)
+
+    def _build_advanced_tab(self, notebook: QTabWidget):
+        lay = self._settings_page(notebook, "Advanced")
+        self.sp_jitter = self._float_spin(0.0, 5000.0, 0.0, step=10)
+        self.sp_max_banner = self._float_spin(0.1, 10.0, 2.0)
+        self._spin_row(lay, "Jitter (ms)", self.sp_jitter)
+        self._spin_row(lay, "Banner Wait (s)", self.sp_max_banner)
+
+        self.chk_udp_probes = QCheckBox("UDP Service Probes")
+        self.chk_udp_probes.setChecked(True)
+        lay.addWidget(self.chk_udp_probes)
+        self.chk_quick_resolve = QCheckBox("DNS Reverse Lookup")
+        self.chk_quick_resolve.setChecked(True)
+        lay.addWidget(self.chk_quick_resolve)
+
+        rrow = hbox()
+        rrow.addWidget(
+            self._make_button(
+                "Resolve Targets Now", self._resolve_targets, fg=C["accent"], pad=(8, 4)
             )
-
-    def _bind_mousewheel(self, area: tk.Widget, canvas: tk.Canvas):
-        """Scroll *canvas* with the wheel while the pointer is over *area*."""
-
-        def _on_wheel(event):
-            if getattr(event, "num", 0) == 4:
-                delta = -1
-            elif getattr(event, "num", 0) == 5:
-                delta = 1
-            else:
-                delta = -1 if event.delta > 0 else 1
-            canvas.yview_scroll(delta * 2, "units")
-
-        def _bind(_e):
-            canvas.bind_all("<MouseWheel>", _on_wheel)
-            canvas.bind_all("<Button-4>", _on_wheel)
-            canvas.bind_all("<Button-5>", _on_wheel)
-
-        def _unbind(_e):
-            canvas.unbind_all("<MouseWheel>")
-            canvas.unbind_all("<Button-4>")
-            canvas.unbind_all("<Button-5>")
-
-        area.bind("<Enter>", _bind)
-        area.bind("<Leave>", _unbind)
-
-    def _build_perf_tab(self, notebook):
-        tab = tk.Frame(notebook, bg=C["surface2"])
-        notebook.add(tab, text="Performance")
-
-        items = [
-            ("Threads", self.var_threads, 1, 1000, ""),
-            ("Reply Timeout (s)", self.var_timeout, 0.1, 30.0, "UDP/raw"),
-            ("Connect Timeout (s)", self.var_connect_timeout, 0.5, 60.0, "TCP"),
-            ("Rate Limit (ms)", self.var_rate_limit, 0.0, 5000.0, "0=off"),
-            ("Probe Attempts", self.var_retry, 1, 5, "UDP/raw"),
-        ]
-        for label, var, mn, mx, hint in items:
-            row = tk.Frame(tab, bg=C["surface2"])
-            row.pack(fill="x", padx=8, pady=3)
-            tk.Label(
-                row,
-                text=label,
-                bg=C["surface2"],
-                fg=C["text2"],
-                font=FONT_MONO_SM,
-                width=19,
-                anchor="w",
-            ).pack(side="left")
-            is_int = isinstance(var, tk.IntVar)
-            inc = 1 if is_int else 0.1
-            sp = ttk.Spinbox(
-                row, from_=mn, to=mx, textvariable=var, width=8, font=FONT_MONO_SM, increment=inc
-            )
-            sp.pack(side="left", padx=4)
-            if hint:
-                tk.Label(row, text=hint, bg=C["surface2"], fg=C["text3"], font=FONT_TINY).pack(
-                    side="left"
-                )
-
-    def _build_output_tab(self, notebook):
-        tab = tk.Frame(notebook, bg=C["surface2"])
-        notebook.add(tab, text="Detection")
-
-        checks = [
-            ("Banner Grabbing", self.var_banner_grab),
-            ("Service Detection", self.var_service_detect),
-            ("OS Detection (heuristic)", self.var_os_detect),
-            ("SSL/TLS Probing", self.var_ssl_probe),
-            ("Host Discovery", self.var_host_discovery),
-            ("Show Filtered Ports", self.var_show_filtered),
-            ("Show Closed Ports", self.var_show_closed),
-        ]
-        for label, var in checks:
-            ttk.Checkbutton(tab, text=label, variable=var, style="TCheckbutton").pack(
-                anchor="w", padx=10, pady=2
-            )
-
-    def _build_advanced_tab(self, notebook):
-        tab = tk.Frame(notebook, bg=C["surface2"])
-        notebook.add(tab, text="Advanced")
-
-        # Jitter
-        jrow = tk.Frame(tab, bg=C["surface2"])
-        jrow.pack(fill="x", padx=8, pady=3)
-        tk.Label(
-            jrow,
-            text="Jitter (ms)",
-            bg=C["surface2"],
-            fg=C["text2"],
-            font=FONT_MONO_SM,
-            width=20,
-            anchor="w",
-        ).pack(side="left")
-        ttk.Spinbox(
-            jrow,
-            from_=0,
-            to=5000,
-            textvariable=self.var_jitter,
-            width=8,
-            font=FONT_MONO_SM,
-            increment=10,
-        ).pack(side="left", padx=4)
-
-        # Max banner wait
-        brow = tk.Frame(tab, bg=C["surface2"])
-        brow.pack(fill="x", padx=8, pady=3)
-        tk.Label(
-            brow,
-            text="Banner Wait (s)",
-            bg=C["surface2"],
-            fg=C["text2"],
-            font=FONT_MONO_SM,
-            width=20,
-            anchor="w",
-        ).pack(side="left")
-        ttk.Spinbox(
-            brow,
-            from_=0.1,
-            to=10.0,
-            textvariable=self.var_max_banner,
-            width=8,
-            font=FONT_MONO_SM,
-            increment=0.1,
-        ).pack(side="left", padx=4)
-
-        # UDP probes
-        ttk.Checkbutton(tab, text="UDP Service Probes", variable=self.var_udp_probes).pack(
-            anchor="w", padx=10, pady=3
         )
+        rrow.addStretch(1)
+        lay.addSpacing(4)
+        lay.addLayout(rrow)
 
-        # Quick resolve
-        ttk.Checkbutton(tab, text="DNS Reverse Lookup", variable=self.var_quick_resolve).pack(
-            anchor="w", padx=10, pady=3
+        crow = hbox(spacing=6)
+        self.lbl_port_count = label("Ports to scan: —", C["text3"])
+        crow.addWidget(self.lbl_port_count)
+        crow.addWidget(self._make_button("Count", self._count_ports, fg=C["text2"], pad=(6, 2)))
+        crow.addStretch(1)
+        lay.addLayout(crow)
+
+        prow = hbox(spacing=4)
+        prow.addWidget(
+            self._make_button("💾 Save Profile", self._save_profile, fg=C["accent"], pad=(8, 4))
         )
-
-        # Resolve button
-        rrow = tk.Frame(tab, bg=C["surface2"])
-        rrow.pack(fill="x", padx=8, pady=6)
-        self._make_button(
-            rrow,
-            "Resolve Targets Now",
-            self._resolve_targets,
-            fg=C["accent"],
-            bg=C["btn_bg"],
-            hover_bg=C["btn_hover"],
-            pad=(8, 4),
-        ).pack(side="left")
-
-        # Port count display
-        crow = tk.Frame(tab, bg=C["surface2"])
-        crow.pack(fill="x", padx=8, pady=3)
-        self.lbl_port_count = tk.Label(
-            crow, text="Ports to scan: —", bg=C["surface2"], fg=C["text3"], font=FONT_MONO_SM
+        prow.addWidget(
+            self._make_button("📂 Load Profile", self._load_profile, fg=C["accent"], pad=(8, 4))
         )
-        self.lbl_port_count.pack(side="left")
-        self._make_button(
-            crow,
-            "Count",
-            self._count_ports,
-            fg=C["text2"],
-            bg=C["btn_bg"],
-            hover_bg=C["btn_hover"],
-            pad=(6, 2),
-        ).pack(side="left", padx=4)
+        prow.addStretch(1)
+        lay.addSpacing(4)
+        lay.addLayout(prow)
+        lay.addStretch(1)
 
-        # Profile management
-        prow = tk.Frame(tab, bg=C["surface2"])
-        prow.pack(fill="x", padx=8, pady=6)
+    # ── Right panel ──
 
-        self._make_button(
-            prow,
-            "💾 Save Profile",
-            self._save_profile,
-            fg=C["accent"],
-            bg=C["btn_bg"],
-            hover_bg=C["btn_hover"],
-            pad=(8, 4),
-        ).pack(side="left", padx=2)
-
-        self._make_button(
-            prow,
-            "📂 Load Profile",
-            self._load_profile,
-            fg=C["accent"],
-            bg=C["btn_bg"],
-            hover_bg=C["btn_hover"],
-            pad=(8, 4),
-        ).pack(side="left", padx=2)
-
-    def _build_right_panel(self, parent):
-        frame = tk.Frame(parent, bg=C["bg"])
+    def _build_right_panel(self) -> QWidget:
+        panel = frame("bg")
+        lay = vbox(panel)
 
         # ── Stats bar ──
-        self._build_stats_bar(frame)
+        stats_wrap = hbox(margins=(8, 8, 8, 4))
+        stats_wrap.addWidget(self._build_stats_bar())
+        lay.addLayout(stats_wrap)
 
         # ── Progress bar with ETA ──
-        pbar_frame = tk.Frame(frame, bg=C["bg"])
-        pbar_frame.pack(fill="x", padx=12, pady=(0, 6))
-
-        self.progress = ttk.Progressbar(
-            pbar_frame, style="Scan.Horizontal.TProgressbar", mode="determinate", length=400
+        prow = hbox(margins=(12, 0, 12, 6), spacing=4)
+        self.progress = QProgressBar()
+        self.progress.setRange(0, 1000)
+        self.progress.setTextVisible(False)
+        prow.addWidget(self.progress, 1)
+        self.lbl_progress = label("0%", C["text3"])
+        self.lbl_progress.setFixedWidth(
+            self.lbl_progress.fontMetrics().horizontalAdvance("100%") + 6
         )
-        self.progress.pack(fill="x", side="left", expand=True)
-
-        eta_col = tk.Frame(pbar_frame, bg=C["bg"])
-        eta_col.pack(side="right", padx=4)
-        self.lbl_progress = tk.Label(
-            eta_col, text="0%", bg=C["bg"], fg=C["text3"], font=FONT_MONO_SM, width=4
-        )
-        self.lbl_progress.pack(side="left", padx=2)
-        tk.Label(eta_col, text="ETA:", bg=C["bg"], fg=C["text3"], font=FONT_MONO_SM).pack(
-            side="left", padx=(8, 2)
-        )
-        self.lbl_eta = tk.Label(
-            eta_col,
-            textvariable=self.stat_eta,
-            bg=C["bg"],
-            fg=C["accent"],
-            font=FONT_MONO_SM,
-            width=10,
-        )
-        self.lbl_eta.pack(side="left")
-        self.lbl_rate = tk.Label(
-            eta_col, text="", bg=C["bg"], fg=C["text3"], font=FONT_MONO_SM, width=12, anchor="e"
-        )
-        self.lbl_rate.pack(side="left")
+        self.lbl_progress.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        prow.addWidget(self.lbl_progress)
+        prow.addSpacing(6)
+        prow.addWidget(label("ETA:", C["text3"]))
+        self.lbl_eta = label("—", C["accent"])
+        self.lbl_eta.setFixedWidth(self.lbl_eta.fontMetrics().horizontalAdvance("0" * 10))
+        self.lbl_eta.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        prow.addWidget(self.lbl_eta)
+        self.lbl_rate = label("", C["text3"])
+        self.lbl_rate.setFixedWidth(self.lbl_rate.fontMetrics().horizontalAdvance("0" * 12))
+        self.lbl_rate.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        prow.addWidget(self.lbl_rate)
+        lay.addLayout(prow)
 
         # ── Notebook: Results / Log / Detail / Stats / Vulns / History ──
-        nb = ttk.Notebook(frame)
-        nb.pack(fill="both", expand=True, padx=8, pady=(0, 4))
+        nb_wrap = hbox(margins=(8, 0, 8, 4))
+        nb = QTabWidget()
+        nb.setObjectName("outer")
+        nb.setDocumentMode(True)
         self.notebook = nb
-
         self._build_results_tab(nb)
         self._build_log_tab(nb)
         self._build_detail_tab(nb)
         self._build_compare_tab(nb)
         self._build_vuln_tab(nb)
         self._build_history_tab(nb)
+        nb_wrap.addWidget(nb)
+        lay.addLayout(nb_wrap, 1)
+        return panel
 
-        return frame
+    def _build_stats_bar(self) -> QWidget:
+        bar = frame("surface")
+        bar.setFixedHeight(88)
+        lay = hbox(bar, margins=(1, 4, 1, 4), spacing=4)
 
-    def _build_stats_bar(self, parent):
-        bar = tk.Frame(parent, bg=C["surface"], height=88)
-        bar.pack(fill="x", padx=8, pady=(8, 4))
-        bar.pack_propagate(False)
+        self.card_open = StatCard("OPEN PORTS", C["green"])
+        self.card_filtered = StatCard("FILTERED", C["yellow"])
+        self.card_hosts_up = StatCard("HOSTS UP", C["accent"])
+        self.card_ports_done = StatCard("PORTS DONE", C["purple"])
+        for card in (self.card_open, self.card_filtered, self.card_hosts_up, self.card_ports_done):
+            lay.addWidget(card, 1)
 
-        stats = [
-            ("OPEN PORTS", self.stat_open, C["green"]),
-            ("FILTERED", self.stat_filtered, C["yellow"]),
-            ("HOSTS UP", self.stat_hosts_up, C["accent"]),
-            ("PORTS DONE", self.stat_ports_done, C["purple"]),
-        ]
+        sep_wrap = vbox(margins=(0, 4, 0, 4))
+        sep_wrap.addWidget(vsep())
+        lay.addLayout(sep_wrap)
 
-        for label, var, color in stats:
-            col = tk.Frame(bar, bg=C["surface"])
-            col.pack(side="left", expand=True, fill="both", padx=1)
-
-            inner = tk.Frame(col, bg=C["surface2"])
-            inner.pack(fill="both", expand=True, padx=2, pady=4)
-            tk.Frame(inner, bg=color, height=2).pack(fill="x", side="top")
-
-            val_lbl = tk.Label(inner, textvariable=var, font=FONT_STAT, bg=C["surface2"], fg=color)
-            val_lbl.pack(pady=(6, 0))
-            tk.Label(inner, text=label, font=FONT_MONO_SM, bg=C["surface2"], fg=C["text3"]).pack()
-
-        # Separator + scan info
-        sep = tk.Frame(bar, bg=C["border"], width=1)
-        sep.pack(side="left", fill="y", pady=8)
-
-        info_col = tk.Frame(bar, bg=C["surface"])
-        info_col.pack(side="left", fill="both", expand=True, padx=2)
-        inner2 = tk.Frame(info_col, bg=C["surface2"])
-        inner2.pack(fill="both", expand=True, padx=2, pady=4)
-        self.status_strip = tk.Frame(inner2, bg=C["text3"], height=2)
-        self.status_strip.pack(fill="x", side="top")
-
-        tk.Label(inner2, text="STATUS", font=FONT_MONO_SM, bg=C["surface2"], fg=C["text3"]).pack(
-            pady=(6, 0)
+        info = frame("surface2")
+        il = vbox(info)
+        self.status_strip = QFrame()
+        self.status_strip.setFixedHeight(2)
+        il.addWidget(self.status_strip)
+        il.addSpacing(6)
+        il.addWidget(label("STATUS", C["text3"], align=Qt.AlignmentFlag.AlignCenter))
+        self.lbl_status = label(
+            "IDLE", C["text2"], Fonts.mono_lg(), align=Qt.AlignmentFlag.AlignCenter
         )
-        self.lbl_status = tk.Label(
-            inner2, text="IDLE", font=FONT_MONO_LG, bg=C["surface2"], fg=C["text2"]
-        )
-        self.lbl_status.pack()
-        self.lbl_current = tk.Label(
-            inner2, text="—", font=FONT_MONO_SM, bg=C["surface2"], fg=C["text3"], wraplength=200
-        )
-        self.lbl_current.pack()
+        il.addWidget(self.lbl_status)
+        self.lbl_current = label("—", C["text3"], align=Qt.AlignmentFlag.AlignCenter)
+        il.addWidget(self.lbl_current)
+        il.addStretch(1)
+        self.status_strip.setStyleSheet(f"background: {C['text3']};")
+        lay.addWidget(info, 1)
+        return bar
 
-    def _build_results_tab(self, notebook):
-        tab = tk.Frame(notebook, bg=C["bg"])
-        notebook.add(tab, text="  Results  ")
+    def _bar(self) -> tuple[QFrame, Any]:
+        """Dark control strip used at the top of most tabs."""
+        bar = frame("surface")
+        return bar, hbox(bar, margins=(8, 4, 8, 4), spacing=6)
+
+    def _tab_page(self, notebook: QTabWidget, title: str) -> tuple[QWidget, Any]:
+        tab = frame("bg")
+        lay = vbox(tab, margins=(4, 4, 4, 4), spacing=2)
+        notebook.addTab(tab, title)
+        return tab, lay
+
+    def _build_results_tab(self, notebook: QTabWidget):
+        tab, lay = self._tab_page(notebook, "  Results  ")
+        self.tab_results = tab
 
         # Filter bar
-        fbar = tk.Frame(tab, bg=C["surface"])
-        fbar.pack(fill="x", padx=4, pady=(4, 2))
-
-        tk.Label(fbar, text="🔍 Filter:", bg=C["surface"], fg=C["text2"], font=FONT_MONO_SM).pack(
-            side="left", padx=8
+        fbar, fl = self._bar()
+        fl.addWidget(label("🔍 Filter:", C["text2"]))
+        self.entry_filter = QLineEdit()
+        self.entry_filter.setMinimumWidth(120)
+        self.entry_filter.setMaximumWidth(
+            self.entry_filter.fontMetrics().horizontalAdvance("x" * 30) + 14
         )
-        self.entry_filter = tk.Entry(
-            fbar,
-            textvariable=self.var_filter_text,
-            bg=C["input_bg"],
-            fg=C["text"],
-            insertbackground=C["accent"],
-            relief="flat",
-            bd=0,
-            highlightthickness=1,
-            highlightcolor=C["accent2"],
-            highlightbackground=C["border2"],
-            font=FONT_MONO_SM,
-            width=30,
+        self.entry_filter.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.entry_filter.textChanged.connect(lambda _t: self._apply_filter())
+        fl.addWidget(self.entry_filter)
+        self.chk_filter_regex = QCheckBox("Regex")
+        self.chk_filter_regex.toggled.connect(lambda _c: self._apply_filter())
+        fl.addWidget(self.chk_filter_regex)
+
+        fl.addSpacing(8)
+        fl.addWidget(label("Sort:", C["text2"]))
+        self.cb_sort = QComboBox()
+        self.cb_sort.addItems(["Port ↑", "Port ↓", "Service", "Response Time", "State"])
+        self.cb_sort.setMinimumContentsLength(12)
+        self.cb_sort.activated.connect(lambda _i: self._on_sort_preset())
+        fl.addWidget(self.cb_sort)
+
+        fl.addSpacing(8)
+        fl.addWidget(label("Host:", C["text2"]))
+        self.cb_host_filter = QComboBox()
+        self.cb_host_filter.addItem("All")
+        self.cb_host_filter.setMinimumContentsLength(14)
+        self.cb_host_filter.setSizeAdjustPolicy(
+            QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon
         )
-        self.entry_filter.pack(side="left", padx=4, ipady=4)
+        self.cb_host_filter.activated.connect(lambda _i: self._refresh_results_view())
+        fl.addWidget(self.cb_host_filter)
 
-        ttk.Checkbutton(
-            fbar, text="Regex", variable=self.var_filter_regex, style="Bar.TCheckbutton"
-        ).pack(side="left", padx=2)
+        fl.addStretch(1)
+        self.lbl_result_count = label("0 results", C["text3"])
+        fl.addWidget(self.lbl_result_count)
+        lay.addWidget(fbar)
 
-        # Sort controls
-        tk.Label(fbar, text="Sort:", bg=C["surface"], fg=C["text2"], font=FONT_MONO_SM).pack(
-            side="left", padx=(12, 4)
-        )
-        sort_opts = ["Port ↑", "Port ↓", "Service", "Response Time", "State"]
-        self.var_sort = tk.StringVar(value="Port ↑")
-        sort_cb = ttk.Combobox(
-            fbar,
-            textvariable=self.var_sort,
-            values=sort_opts,
-            state="readonly",
-            width=14,
-            font=FONT_MONO_SM,
-        )
-        sort_cb.pack(side="left", padx=4)
-        sort_cb.bind("<<ComboboxSelected>>", self._on_sort_preset)
-
-        # Host filter
-        tk.Label(fbar, text="Host:", bg=C["surface"], fg=C["text2"], font=FONT_MONO_SM).pack(
-            side="left", padx=(12, 4)
-        )
-        self.var_host_filter = tk.StringVar(value="All")
-        self.cb_host_filter = ttk.Combobox(
-            fbar,
-            textvariable=self.var_host_filter,
-            values=["All"],
-            state="readonly",
-            width=18,
-            font=FONT_MONO_SM,
-        )
-        self.cb_host_filter.pack(side="left", padx=4)
-        self.cb_host_filter.bind("<<ComboboxSelected>>", lambda e: self._refresh_results_view())
-
-        # Count label
-        self.lbl_result_count = tk.Label(
-            fbar, text="0 results", bg=C["surface"], fg=C["text3"], font=FONT_MONO_SM
-        )
-        self.lbl_result_count.pack(side="right", padx=12)
-
-        # Treeview
-        cols = ("host", "port", "proto", "state", "service", "version", "rtt", "banner")
-        col_labels = ("Host", "Port", "Proto", "State", "Service", "Version", "RTT ms", "Banner")
-        col_widths = (130, 60, 55, 80, 110, 140, 70, 200)
-
-        tree_frame = tk.Frame(tab, bg=C["bg"])
-        tree_frame.pack(fill="both", expand=True, padx=4, pady=(0, 4))
-
-        self.tree = ttk.Treeview(tree_frame, columns=cols, show="headings", selectmode="extended")
-        self._col_labels = dict(zip(cols, col_labels))
-
-        for col, lbl, w in zip(cols, col_labels, col_widths):
-            self.tree.heading(col, text=lbl, command=lambda c=col: self._sort_tree(c))
-            anchor = "center" if col in ("port", "proto", "rtt") else "w"
-            self.tree.column(col, width=w, minwidth=40, anchor=anchor, stretch=col == "banner")
-
-        # Scrollbars
-        vsb = ttk.Scrollbar(tree_frame, orient="vertical", command=self.tree.yview)
-        hsb = ttk.Scrollbar(tree_frame, orient="horizontal", command=self.tree.xview)
-        self.tree.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
-
-        vsb.pack(side="right", fill="y")
-        hsb.pack(side="bottom", fill="x")
-        self.tree.pack(fill="both", expand=True)
-
-        # Row tags: state sets the text colour, striping sets the background
-        self.tree.tag_configure("even", background=C["row_even"])
-        self.tree.tag_configure("odd", background=C["row_odd"])
-        self.tree.tag_configure("open", foreground=C["green"])
-        self.tree.tag_configure("filtered", foreground=C["yellow"])
-        self.tree.tag_configure("closed", foreground=C["text3"])
-        self.tree.tag_configure("warn", foreground=C["orange"])
+        # Table
+        self.results_model = ResultsModel(self)
+        tree = QTableView()
+        tree.setModel(self.results_model)
+        tree.setFont(Fonts.mono_sm())
+        tree.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        tree.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        tree.setAlternatingRowColors(True)
+        tree.setShowGrid(False)
+        tree.setWordWrap(False)
+        tree.setFrameShape(QFrame.Shape.NoFrame)
+        tree.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        tree.setHorizontalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
+        tree.verticalHeader().setVisible(False)
+        tree.verticalHeader().setDefaultSectionSize(26)
+        tree.verticalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Fixed)
+        hdr = tree.horizontalHeader()
+        hdr.setHighlightSections(False)
+        hdr.setSectionsClickable(True)
+        hdr.setMinimumSectionSize(40)
+        hdr.setStretchLastSection(True)  # banner column stretches
+        for i, w in enumerate(COLUMN_WIDTHS):
+            tree.setColumnWidth(i, w)
+        hdr.sectionClicked.connect(lambda idx: self._sort_tree(COLUMNS[idx]))
+        tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        tree.customContextMenuRequested.connect(self._tree_context_menu)
+        tree.doubleClicked.connect(lambda _idx: self._show_port_detail())
+        self.tree = tree
 
         # Empty-state hint (hidden as soon as rows appear)
-        self.lbl_empty = tk.Label(
-            tree_frame,
-            text="No results yet\n\nEnter a target and press F5 to start a scan",
-            bg=C["surface"],
-            fg=C["text3"],
-            font=FONT_MONO,
-            justify="center",
+        vp_lay = vbox(tree.viewport())
+        self.lbl_empty = label(
+            "No results yet\n\nEnter a target and press F5 to start a scan",
+            C["text3"],
+            Fonts.mono_md(),
+            align=Qt.AlignmentFlag.AlignCenter,
         )
-        self.lbl_empty.place(relx=0.5, rely=0.45, anchor="center")
+        self.lbl_empty.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        vp_lay.addStretch(9)
+        vp_lay.addWidget(self.lbl_empty)
+        vp_lay.addStretch(11)
 
-        # Context menu (Button-2 is the right button on macOS)
-        self.tree.bind("<Button-3>", self._tree_context_menu)
-        if sys.platform == "darwin":
-            self.tree.bind("<Button-2>", self._tree_context_menu)
-        self.tree.bind("<Double-Button-1>", self._show_port_detail)
-        self.tree.bind("<Return>", self._show_port_detail)
-        self.tree.bind("<Control-c>", lambda e: self._copy_selected_rows())
+        lay.addWidget(tree, 1)
 
-    def _build_log_tab(self, notebook):
-        tab = tk.Frame(notebook, bg=C["bg"])
-        notebook.add(tab, text="  Live Log  ")
+    def _build_log_tab(self, notebook: QTabWidget):
+        tab, lay = self._tab_page(notebook, "  Live Log  ")
 
-        # Controls
-        ctrl = tk.Frame(tab, bg=C["surface"])
-        ctrl.pack(fill="x", padx=4, pady=(4, 2))
-
-        self.var_log_level = tk.StringVar(value="All")
+        ctrl, cl = self._bar()
+        self.log_level_group = QButtonGroup(self)
         for lbl, val in [("All", "All"), ("Open Only", "Open"), ("Errors", "Error")]:
-            rb = tk.Radiobutton(
-                ctrl,
-                text=lbl,
-                variable=self.var_log_level,
-                value=val,
-                bg=C["surface"],
-                fg=C["text2"],
-                selectcolor=C["accent_dim"],
-                activebackground=C["surface"],
-                activeforeground=C["white"],
-                font=FONT_MONO_SM,
-                cursor="hand2",
-                highlightthickness=0,
-                bd=0,
-                command=self._rerender_log,
-            )
-            rb.pack(side="left", padx=8, pady=4)
+            rb = QRadioButton(lbl)
+            rb.setObjectName("logFilter")
+            rb.setCursor(Qt.CursorShape.PointingHandCursor)
+            rb.setProperty("level", val)
+            rb.setChecked(val == "All")
+            self.log_level_group.addButton(rb)
+            cl.addWidget(rb)
+            cl.addSpacing(8)
+        self.log_level_group.buttonClicked.connect(self._on_log_level)
+        cl.addStretch(1)
+        self.chk_autoscroll = QCheckBox("Auto-scroll")
+        self.chk_autoscroll.setChecked(True)
+        cl.addWidget(self.chk_autoscroll)
+        cl.addWidget(self._make_button("Clear Log", self._clear_log, fg=C["text2"], pad=(8, 3)))
+        lay.addWidget(ctrl)
 
-        self._make_button(
-            ctrl,
-            "Clear Log",
-            self._clear_log,
-            fg=C["text2"],
-            bg=C["btn_bg"],
-            hover_bg=C["btn_hover"],
-            pad=(8, 3),
-        ).pack(side="right", padx=8)
+        self.txt_log = TaggedText(padding=(8, 6), max_lines=self._LOG_MAX_LINES)
+        for tag, fg in [
+            ("open", C["green"]),
+            ("filtered", C["yellow"]),
+            ("closed", C["text3"]),
+            ("info", C["accent"]),
+            ("error", C["red"]),
+            ("host", C["purple"]),
+            ("timestamp", C["text3"]),
+            ("ssl", C["accent2"]),
+            ("banner", C["orange"]),
+        ]:
+            self.txt_log.tag_configure(tag, fg)
+        lay.addWidget(self.txt_log, 1)
 
-        self.var_autoscroll = tk.BooleanVar(value=True)
-        ttk.Checkbutton(
-            ctrl, text="Auto-scroll", variable=self.var_autoscroll, style="Bar.TCheckbutton"
-        ).pack(side="right", padx=4)
+    def _build_detail_tab(self, notebook: QTabWidget):
+        tab = frame("bg")
+        notebook.addTab(tab, "  Port Detail  ")
+        lay = vbox(tab)
 
-        # Log text area
-        log_frame = tk.Frame(tab, bg=C["bg"])
-        log_frame.pack(fill="both", expand=True, padx=4, pady=(0, 4))
+        pw = QSplitter(Qt.Orientation.Horizontal)
+        pw.setObjectName("thin")
+        pw.setHandleWidth(3)
+        pw.setChildrenCollapsible(False)
 
-        self.txt_log = tk.Text(
-            log_frame,
-            bg=C["bg"],
-            fg=C["text"],
-            font=FONT_MONO_SM,
-            state="disabled",
-            relief="flat",
-            bd=0,
-            highlightthickness=1,
-            highlightbackground=C["border"],
-            insertbackground=C["accent"],
-            wrap="none",
-            padx=8,
-            pady=6,
-        )
+        left = frame("surface")
+        ll = vbox(left, margins=(4, 4, 4, 4), spacing=4)
+        hosts_lbl = label("HOSTS", C["accent"])
+        hosts_lbl.setContentsMargins(4, 0, 0, 0)
+        ll.addWidget(hosts_lbl)
+        self.host_listbox = QListWidget()
+        self.host_listbox.setFont(Fonts.mono_sm())
+        self.host_listbox.currentRowChanged.connect(self._on_host_select)
+        ll.addWidget(self.host_listbox, 1)
+        left.setMinimumWidth(200)
+        pw.addWidget(left)
 
-        log_vsb = ttk.Scrollbar(log_frame, orient="vertical", command=self.txt_log.yview)
-        log_hsb = ttk.Scrollbar(log_frame, orient="horizontal", command=self.txt_log.xview)
-        self.txt_log.configure(yscrollcommand=log_vsb.set, xscrollcommand=log_hsb.set)
-
-        log_vsb.pack(side="right", fill="y")
-        log_hsb.pack(side="bottom", fill="x")
-        self.txt_log.pack(fill="both", expand=True)
-
-        # Log tags
-        self.txt_log.tag_configure("open", foreground=C["green"])
-        self.txt_log.tag_configure("filtered", foreground=C["yellow"])
-        self.txt_log.tag_configure("closed", foreground=C["text3"])
-        self.txt_log.tag_configure("info", foreground=C["accent"])
-        self.txt_log.tag_configure("error", foreground=C["red"])
-        self.txt_log.tag_configure("host", foreground=C["purple"])
-        self.txt_log.tag_configure("timestamp", foreground=C["text3"])
-        self.txt_log.tag_configure("ssl", foreground=C["accent2"])
-        self.txt_log.tag_configure("banner", foreground=C["orange"])
-
-    def _build_detail_tab(self, notebook):
-        tab = tk.Frame(notebook, bg=C["bg"])
-        notebook.add(tab, text="  Port Detail  ")
-
-        # Left: host tree
-        pw = tk.PanedWindow(tab, orient="horizontal", bg=C["border"], sashwidth=3, handlesize=0)
-        pw.pack(fill="both", expand=True)
-
-        left = tk.Frame(pw, bg=C["surface"])
-        pw.add(left, minsize=200, width=240)
-
-        tk.Label(left, text="HOSTS", bg=C["surface"], fg=C["accent"], font=FONT_MONO_SM).pack(
-            anchor="w", padx=8, pady=4
-        )
-
-        self.host_listbox = tk.Listbox(
-            left,
-            bg=C["surface2"],
-            fg=C["text"],
-            font=FONT_MONO_SM,
-            selectbackground=C["select"],
-            selectforeground=C["white"],
-            relief="flat",
-            bd=0,
-            highlightthickness=0,
-            activestyle="none",
-        )
-        self.host_listbox.pack(fill="both", expand=True, padx=4, pady=4)
-        self.host_listbox.bind("<<ListboxSelect>>", self._on_host_select)
-
-        # Right: detail view
-        right = tk.Frame(pw, bg=C["bg"])
-        pw.add(right, minsize=400)
-
-        self.detail_text = tk.Text(
-            right,
-            bg=C["bg"],
-            fg=C["text"],
-            font=FONT_MONO_SM,
-            state="disabled",
-            relief="flat",
-            bd=0,
-            highlightthickness=0,
-            wrap="none",
-            padx=12,
-            pady=8,
-        )
-
-        det_vsb = ttk.Scrollbar(right, orient="vertical", command=self.detail_text.yview)
-        det_hsb = ttk.Scrollbar(right, orient="horizontal", command=self.detail_text.xview)
-        self.detail_text.configure(yscrollcommand=det_vsb.set, xscrollcommand=det_hsb.set)
-
-        det_vsb.pack(side="right", fill="y")
-        det_hsb.pack(side="bottom", fill="x")
-        self.detail_text.pack(fill="both", expand=True)
-
-        # Detail text tags
+        self.detail_text = TaggedText(bordered=False, padding=(12, 8))
+        self.detail_text.setMinimumWidth(400)
         for tag, fg_color in [
             ("header", C["accent"]),
             ("subheader", C["purple"]),
@@ -1344,33 +815,19 @@ class NexScanApp(tk.Tk):
             ("ssl_text", C["accent2"]),
             ("sep", C["border2"]),
         ]:
-            self.detail_text.tag_configure(tag, foreground=fg_color)
-        self.detail_text.tag_configure("bold", font=(FONT_MONO[0], 10, "bold"))
-        self.detail_text.tag_configure("mono_lg", font=FONT_MONO_LG)
+            self.detail_text.tag_configure(tag, fg_color)
+        self.detail_text.tag_configure("bold", font=Fonts.make(10, bold=True))
+        self.detail_text.tag_configure("mono_lg", font=Fonts.mono_lg())
+        pw.addWidget(self.detail_text)
+        pw.setStretchFactor(1, 1)
+        pw.setSizes([240, 800])
+        lay.addWidget(pw)
 
-    def _build_compare_tab(self, notebook):
-        tab = tk.Frame(notebook, bg=C["bg"])
-        notebook.add(tab, text="  Statistics  ")
-
-        # Stats grid
-        stats_frame = tk.Frame(tab, bg=C["bg"])
-        stats_frame.pack(fill="both", expand=True, padx=8, pady=8)
-
-        self.stats_text = tk.Text(
-            stats_frame,
-            bg=C["bg"],
-            fg=C["text"],
-            font=FONT_MONO_SM,
-            state="disabled",
-            relief="flat",
-            bd=0,
-            wrap="none",
-            highlightthickness=0,
-            padx=12,
-            pady=8,
-        )
-        self.stats_text.pack(fill="both", expand=True)
-
+    def _build_compare_tab(self, notebook: QTabWidget):
+        tab = frame("bg")
+        notebook.addTab(tab, "  Statistics  ")
+        lay = vbox(tab, margins=(8, 8, 8, 8))
+        self.stats_text = TaggedText(bordered=False, padding=(12, 8))
         for tag, fg_c in [
             ("header", C["accent"]),
             ("key", C["text2"]),
@@ -1381,66 +838,36 @@ class NexScanApp(tk.Tk):
             ("warn", C["yellow"]),
             ("danger", C["red"]),
         ]:
-            self.stats_text.tag_configure(tag, foreground=fg_c)
+            self.stats_text.tag_configure(tag, fg_c)
+        lay.addWidget(self.stats_text)
 
-    def _build_vuln_tab(self, notebook):
+    def _build_vuln_tab(self, notebook: QTabWidget):
         """Tab for CVE/vulnerability info and geolocation."""
-        tab = tk.Frame(notebook, bg=C["bg"])
-        notebook.add(tab, text="  Vulnerabilities  ")
+        tab, lay = self._tab_page(notebook, "  Vulnerabilities  ")
         self.tab_vuln = tab
 
-        ctrl = tk.Frame(tab, bg=C["surface"])
-        ctrl.pack(fill="x", padx=4, pady=(4, 2))
-
+        ctrl, cl = self._bar()
         self.btn_cve = self._make_button(
-            ctrl, "🔍 Lookup CVEs", self._lookup_cves, fg=C["red"], pad=(8, 3)
+            "🔍 Lookup CVEs", self._lookup_cves, fg=C["red"], pad=(8, 3)
         )
-        self.btn_cve.pack(side="left", padx=4, pady=4)
+        cl.addWidget(self.btn_cve)
         self.btn_geo = self._make_button(
-            ctrl, "📍 Geolocation + WHOIS", self._lookup_geolocation, fg=C["accent"], pad=(8, 3)
+            "📍 Geolocation + WHOIS", self._lookup_geolocation, fg=C["accent"], pad=(8, 3)
         )
-        self.btn_geo.pack(side="left", padx=4, pady=4)
-
-        self.lbl_vuln_status = tk.Label(
-            ctrl, text="", bg=C["surface"], fg=C["text3"], font=FONT_MONO_SM
-        )
-        self.lbl_vuln_status.pack(side="left", padx=12)
+        cl.addWidget(self.btn_geo)
+        cl.addSpacing(8)
+        self.lbl_vuln_status = label("", C["text3"])
+        cl.addWidget(self.lbl_vuln_status)
+        cl.addStretch(1)
         key_note = (
             "NVD API key: set"
             if os.environ.get("NVD_API_KEY")
             else "Tip: set NVD_API_KEY for 10× faster lookups"
         )
-        tk.Label(ctrl, text=key_note, bg=C["surface"], fg=C["text3"], font=FONT_TINY).pack(
-            side="right", padx=8
-        )
+        cl.addWidget(label(key_note, C["text3"], Fonts.tiny()))
+        lay.addWidget(ctrl)
 
-        # Vulnerability text area
-        vuln_frame = tk.Frame(tab, bg=C["bg"])
-        vuln_frame.pack(fill="both", expand=True, padx=4, pady=(0, 4))
-
-        self.vuln_text = tk.Text(
-            vuln_frame,
-            bg=C["bg"],
-            fg=C["text"],
-            font=FONT_MONO_SM,
-            state="disabled",
-            relief="flat",
-            bd=0,
-            wrap="word",
-            highlightthickness=1,
-            highlightbackground=C["border"],
-            padx=12,
-            pady=8,
-            cursor="arrow",
-        )
-
-        vuln_vsb = ttk.Scrollbar(vuln_frame, orient="vertical", command=self.vuln_text.yview)
-        self.vuln_text.configure(yscrollcommand=vuln_vsb.set)
-
-        vuln_vsb.pack(side="right", fill="y")
-        self.vuln_text.pack(fill="both", expand=True)
-
-        # Tags
+        self.vuln_text = TaggedText(wrap=True, padding=(12, 8))
         for tag, fg_c in [
             ("cve_critical", C["red"]),
             ("cve_high", C["orange"]),
@@ -1449,17 +876,10 @@ class NexScanApp(tk.Tk):
             ("header", C["accent"]),
             ("geo_info", C["accent2"]),
             ("muted", C["text3"]),
-            ("link", C["accent"]),
         ]:
-            self.vuln_text.tag_configure(tag, foreground=fg_c)
-        self.vuln_text.tag_configure("link", underline=True)
-        self.vuln_text.tag_bind(
-            "link", "<Enter>", lambda e: self.vuln_text.configure(cursor="hand2")
-        )
-        self.vuln_text.tag_bind(
-            "link", "<Leave>", lambda e: self.vuln_text.configure(cursor="arrow")
-        )
-        self.vuln_text.tag_bind("link", "<Button-1>", self._open_link_under_cursor)
+            self.vuln_text.tag_configure(tag, fg_c)
+        self.vuln_text.tag_configure("link", C["accent"], link=True)
+        lay.addWidget(self.vuln_text, 1)
         self._vuln_write(
             "Run a scan, then look up known CVEs for fingerprinted services or\n"
             "geolocate public hosts. Lookups run in the background.\n",
@@ -1467,14 +887,12 @@ class NexScanApp(tk.Tk):
             clear=True,
         )
 
-    def _build_history_tab(self, notebook):
+    def _build_history_tab(self, notebook: QTabWidget):
         """Saved scan runs (SQLite) with load / compare / delete."""
-        tab = tk.Frame(notebook, bg=C["bg"])
-        notebook.add(tab, text="  History  ")
+        tab, lay = self._tab_page(notebook, "  History  ")
         self.tab_history = tab
 
-        ctrl = tk.Frame(tab, bg=C["surface"])
-        ctrl.pack(fill="x", padx=4, pady=(4, 2))
+        ctrl, cl = self._bar()
         for text, cmd, fg in [
             ("⟳ Refresh", self._refresh_history, C["text2"]),
             ("💾 Save Current", self._save_current_to_history, C["green"]),
@@ -1483,70 +901,49 @@ class NexScanApp(tk.Tk):
             ("⇄ Diff Selected", self._diff_history_selected, C["purple"]),
             ("✗ Delete", self._delete_history_run, C["red"]),
         ]:
-            self._make_button(ctrl, text, cmd, fg=fg, pad=(8, 3)).pack(side="left", padx=3, pady=4)
+            cl.addWidget(self._make_button(text, cmd, fg=fg, pad=(8, 3)))
+        cl.addStretch(1)
+        self.chk_autosave = QCheckBox("Auto-save each scan")
+        cl.addWidget(self.chk_autosave)
+        lay.addWidget(ctrl)
 
-        ttk.Checkbutton(
-            ctrl,
-            text="Auto-save each scan",
-            variable=self.var_autosave,
-            style="Bar.TCheckbutton",
-        ).pack(side="right", padx=8)
-
-        path_row = tk.Frame(tab, bg=C["bg"])
-        path_row.pack(fill="x", padx=6, pady=(2, 4))
-        tk.Label(path_row, text="Database:", bg=C["bg"], fg=C["text3"], font=FONT_MONO_SM).pack(
-            side="left"
+        path_row = hbox(margins=(2, 2, 2, 4), spacing=6)
+        path_row.addWidget(label("Database:", C["text3"]))
+        self.lbl_db_path = label(self._db_path, C["text2"])
+        self.lbl_db_path.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        path_row.addWidget(self.lbl_db_path)
+        path_row.addWidget(
+            self._make_button("Change…", self._choose_db_path, fg=C["accent"], pad=(6, 1))
         )
-        tk.Label(
-            path_row, textvariable=self.var_db_path, bg=C["bg"], fg=C["text2"], font=FONT_MONO_SM
-        ).pack(side="left", padx=6)
-        self._make_button(
-            path_row, "Change…", self._choose_db_path, fg=C["accent"], pad=(6, 1)
-        ).pack(side="left", padx=4)
+        path_row.addStretch(1)
+        lay.addLayout(path_row)
 
-        pw = tk.PanedWindow(tab, orient="vertical", bg=C["border"], sashwidth=4, handlesize=0)
-        pw.pack(fill="both", expand=True, padx=4, pady=(0, 4))
+        pw = QSplitter(Qt.Orientation.Vertical)
+        pw.setHandleWidth(4)
+        pw.setChildrenCollapsible(False)
 
-        top = tk.Frame(pw, bg=C["bg"])
-        pw.add(top, minsize=120, height=240)
-        cols = ("id", "time", "type", "hosts", "up", "open", "targets")
         labels = ("Run", "Timestamp", "Scan Type", "Hosts", "Up", "Open", "Targets")
         widths = (60, 170, 110, 60, 50, 60, 360)
-        self.history_tree = ttk.Treeview(top, columns=cols, show="headings", selectmode="extended")
-        for col, lbl, w in zip(cols, labels, widths):
-            self.history_tree.heading(col, text=lbl)
-            anchor = "center" if col in ("id", "hosts", "up", "open") else "w"
-            self.history_tree.column(
-                col, width=w, minwidth=40, anchor=anchor, stretch=col == "targets"
-            )
-        self.history_tree.tag_configure("even", background=C["row_even"])
-        self.history_tree.tag_configure("odd", background=C["row_odd"])
-        hvsb = ttk.Scrollbar(top, orient="vertical", command=self.history_tree.yview)
-        self.history_tree.configure(yscrollcommand=hvsb.set)
-        hvsb.pack(side="right", fill="y")
-        self.history_tree.pack(fill="both", expand=True)
-        self.history_tree.bind("<Double-Button-1>", lambda e: self._load_history_run())
+        ht = QTreeWidget()
+        ht.setColumnCount(len(labels))
+        ht.setHeaderLabels(labels)
+        ht.setRootIsDecorated(False)
+        ht.setUniformRowHeights(True)
+        ht.setAlternatingRowColors(True)
+        ht.setFont(Fonts.mono_sm())
+        ht.setFrameShape(QFrame.Shape.NoFrame)
+        ht.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        ht.header().setStretchLastSection(True)
+        ht.header().setMinimumSectionSize(40)
+        for i, w in enumerate(widths):
+            ht.setColumnWidth(i, w)
+        ht.itemDoubleClicked.connect(lambda *_: self._load_history_run())
+        ht.setMinimumHeight(120)
+        self.history_tree = ht
+        pw.addWidget(ht)
 
-        bottom = tk.Frame(pw, bg=C["bg"])
-        pw.add(bottom, minsize=100)
-        self.diff_text = tk.Text(
-            bottom,
-            bg=C["bg"],
-            fg=C["text"],
-            font=FONT_MONO_SM,
-            state="disabled",
-            relief="flat",
-            bd=0,
-            wrap="none",
-            highlightthickness=1,
-            highlightbackground=C["border"],
-            padx=12,
-            pady=8,
-        )
-        dvsb = ttk.Scrollbar(bottom, orient="vertical", command=self.diff_text.yview)
-        self.diff_text.configure(yscrollcommand=dvsb.set)
-        dvsb.pack(side="right", fill="y")
-        self.diff_text.pack(fill="both", expand=True)
+        self.diff_text = TaggedText(padding=(12, 8))
+        self.diff_text.setMinimumHeight(100)
         for tag, fg_c in [
             ("header", C["accent"]),
             ("new", C["green"]),
@@ -1555,53 +952,98 @@ class NexScanApp(tk.Tk):
             ("info", C["purple"]),
             ("muted", C["text3"]),
         ]:
-            self.diff_text.tag_configure(tag, foreground=fg_c)
+            self.diff_text.tag_configure(tag, fg_c)
+        pw.addWidget(self.diff_text)
+        pw.setStretchFactor(1, 1)
+        pw.setSizes([240, 300])
+        lay.addWidget(pw, 1)
         self._write_diff("Select a run and choose Diff to see what changed.\n", clear=True)
+
+    def _build_statusbar(self) -> QWidget:
+        bar = frame("statusbar")
+        bar.setFixedHeight(24)
+        lay = hbox(bar, margins=(12, 0, 12, 0), spacing=12)
+
+        self.lbl_statusbar = label("Ready — Load a target and click Start Scan", C["text3"])
+        lay.addWidget(self.lbl_statusbar)
+        lay.addStretch(1)
+        lay.addWidget(
+            label(
+                "● raw sockets" if self._raw_ok else "○ unprivileged",
+                C["green"] if self._raw_ok else C["text3"],
+            )
+        )
+        self.lbl_hostname = label(self._local_host_info(), C["text3"])
+        lay.addWidget(self.lbl_hostname)
+        lay.addWidget(label(f"◈ NexScan v{self.VERSION}", C["text3"]))
+        return bar
+
+    @staticmethod
+    def _local_host_info() -> str:
+        name = socket.gethostname()
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+                s.connect(("192.0.2.1", 9))  # no packet is sent for UDP connect
+                ip = s.getsockname()[0]
+        except OSError:
+            ip = "127.0.0.1"
+        return f"local: {name} ({ip})"
 
     # ─────────────────────────── HISTORY ───────────────────────────
 
     def _choose_db_path(self):
-        path = filedialog.asksaveasfilename(
-            title="Scan history database",
-            defaultextension=".db",
-            initialfile=os.path.basename(self.var_db_path.get()),
-            filetypes=[("SQLite database", "*.db"), ("All Files", "*.*")],
-            confirmoverwrite=False,
+        path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Scan history database",
+            self._db_path,
+            "SQLite database (*.db);;All Files (*)",
+            options=QFileDialog.Option.DontConfirmOverwrite,
         )
         if path:
-            self.var_db_path.set(path)
+            if not os.path.splitext(path)[1]:
+                path += ".db"
+            self._set_db_path(path)
             self._refresh_history()
+
+    def _set_db_path(self, path: str):
+        self._db_path = path
+        self.lbl_db_path.setText(path)
 
     def _refresh_history(self):
         from core.db import get_timeline_summary
 
         tree = self.history_tree
-        tree.delete(*tree.get_children())
+        tree.clear()
         try:
-            rows = get_timeline_summary(self.var_db_path.get(), limit=500)
+            rows = get_timeline_summary(self._db_path, limit=500)
         except Exception as e:
             self._toast(f"Could not read history: {e}", "error")
             return
-        for i, r in enumerate(rows):
+        center = Qt.AlignmentFlag.AlignCenter
+        items = []
+        for r in rows:
             targets = ", ".join(r["targets"][:6]) + (" …" if len(r["targets"]) > 6 else "")
-            tree.insert(
-                "",
-                "end",
-                iid=str(r["id"]),
-                values=(
-                    r["id"],
+            item = QTreeWidgetItem(
+                [
+                    str(r["id"]),
                     r["timestamp"][:19].replace("T", " "),
-                    r["scan_type"],
-                    r["hosts_scanned"],
-                    r["hosts_up"],
-                    r["total_open_ports"],
+                    str(r["scan_type"]),
+                    str(r["hosts_scanned"]),
+                    str(r["hosts_up"]),
+                    str(r["total_open_ports"]),
                     targets,
-                ),
-                tags=("even" if i % 2 == 0 else "odd",),
+                ]
             )
+            item.setData(0, Qt.ItemDataRole.UserRole, int(r["id"]))
+            for col in (0, 3, 4, 5):
+                item.setTextAlignment(col, center)
+            items.append(item)
+        tree.addTopLevelItems(items)
 
     def _selected_run_ids(self) -> list[int]:
-        return [int(i) for i in self.history_tree.selection()]
+        return [
+            int(it.data(0, Qt.ItemDataRole.UserRole)) for it in self.history_tree.selectedItems()
+        ]
 
     def _save_current_to_history(self, quiet: bool = False):
         if not self.scan_results:
@@ -1611,7 +1053,7 @@ class NexScanApp(tk.Tk):
         from core.db import save_scan_results
 
         try:
-            run_id = save_scan_results(self.var_db_path.get(), self.scan_results)
+            run_id = save_scan_results(self._db_path, self.scan_results)
         except Exception as e:
             self._toast(f"Saving to history failed: {e}", "error")
             return
@@ -1623,7 +1065,7 @@ class NexScanApp(tk.Tk):
     def _load_run(self, run_id: int):
         from core.db import fetch_run_by_id
 
-        row = fetch_run_by_id(self.var_db_path.get(), run_id)
+        row = fetch_run_by_id(self._db_path, run_id)
         if not row:
             self._toast(f"Run #{run_id} not found", "error")
             return None
@@ -1651,14 +1093,12 @@ class NexScanApp(tk.Tk):
         self._set_status(f"RUN #{row[0]}", C["purple"])
         self._set_current(row[1][:19].replace("T", " "))
         self._log(f"Loaded run #{row[0]} ({len(results)} host(s)) from history", "info")
-        self._select_tab(self.notebook.tabs()[0])
+        self._select_tab(self.tab_results)
 
     def _write_diff(self, text: str, tag=None, clear: bool = False):
-        self.diff_text.configure(state="normal")
         if clear:
-            self.diff_text.delete("1.0", "end")
-        self.diff_text.insert("end", text, tag)
-        self.diff_text.configure(state="disabled")
+            self.diff_text.clear_text()
+        self.diff_text.write(text, tag)
 
     def _show_diff(self, title: str, before, after):
         from core.compare import compare_scans, generate_diff_report
@@ -1680,6 +1120,7 @@ class NexScanApp(tk.Tk):
             else:
                 tag = None
             self._write_diff(line + "\n", tag)
+        self.diff_text.scroll_to_top()
 
     def _diff_history_vs_current(self):
         ids = self._selected_run_ids()
@@ -1704,38 +1145,31 @@ class NexScanApp(tk.Tk):
         if not ids:
             self._toast("Select run(s) to delete", "warn")
             return
-        if not messagebox.askyesno(
-            "Delete Runs", f"Permanently delete {len(ids)} run(s) from history?", icon="warning"
+        if not self._ask_yes_no(
+            "Delete Runs", f"Permanently delete {len(ids)} run(s) from history?"
         ):
             return
         from core.db import delete_run
 
         for run_id in ids:
-            delete_run(self.var_db_path.get(), run_id)
+            delete_run(self._db_path, run_id)
         self._refresh_history()
         self._toast(f"Deleted {len(ids)} run(s)", "ok")
 
-    def _open_link_under_cursor(self, event):
-        idx = self.vuln_text.index(f"@{event.x},{event.y}")
-        rng = self.vuln_text.tag_prevrange("link", f"{idx}+1c")
-        if rng:
-            url = self.vuln_text.get(*rng).strip()
-            if url.startswith("http"):
-                webbrowser.open(url)
+    # ─────────────────────────── VULNERABILITIES ───────────────────────────
 
     def _vuln_write(self, text: str, tag=None, clear: bool = False):
-        self.vuln_text.configure(state="normal")
         if clear:
-            self.vuln_text.delete("1.0", "end")
-        self.vuln_text.insert("end", text, tag)
-        self.vuln_text.configure(state="disabled")
-        self.vuln_text.see("end")
+            self.vuln_text.clear_text()
+        self.vuln_text.write(text, tag)
+        self.vuln_text.scroll_to_end()
 
     def _set_vuln_busy(self, busy: bool, status: str = ""):
         self._vuln_busy = busy
         self.btn_cve.set_enabled(not busy)
         self.btn_geo.set_enabled(not busy)
-        self.lbl_vuln_status.configure(text=status, fg=C["accent"] if busy else C["text3"])
+        self.lbl_vuln_status.setText(status)
+        set_fg(self.lbl_vuln_status, C["accent"] if busy else C["text3"])
 
     def _lookup_cves(self):
         """Look up CVEs for fingerprinted services on a background thread."""
@@ -1788,7 +1222,7 @@ class NexScanApp(tk.Tk):
     def _render_cves(self, svc, ver, where, cves, i, n):
         from core.cve_lookup import severity_rank
 
-        self.lbl_vuln_status.configure(text=f"Querying NVD… {i}/{n}")
+        self.lbl_vuln_status.setText(f"Querying NVD… {i}/{n}")
         self._vuln_write(f"\n{svc} {ver}", "header")
         self._vuln_write(f"   {', '.join(where[:4])}{' …' if len(where) > 4 else ''}\n", "muted")
         if not cves:
@@ -1855,59 +1289,10 @@ class NexScanApp(tk.Tk):
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def _build_statusbar(self):
-        bar = tk.Frame(self, bg=C["header_bg"], height=24)
-        bar.pack(fill="x", side="bottom")
-        bar.pack_propagate(False)
-        tk.Frame(self, bg=C["border"], height=1).pack(fill="x", side="bottom")
-
-        self.lbl_statusbar = tk.Label(
-            bar,
-            text="Ready — Load a target and click Start Scan",
-            bg=C["header_bg"],
-            fg=C["text3"],
-            font=FONT_MONO_SM,
-            anchor="w",
-        )
-        self.lbl_statusbar.pack(side="left", padx=12)
-
-        tk.Label(
-            bar,
-            text=f"◈ NexScan v{self.VERSION}",
-            bg=C["header_bg"],
-            fg=C["text3"],
-            font=FONT_MONO_SM,
-        ).pack(side="right", padx=12)
-
-        # Right side: local host + privilege info
-        self.lbl_hostname = tk.Label(
-            bar, text=self._local_host_info(), bg=C["header_bg"], fg=C["text3"], font=FONT_MONO_SM
-        )
-        self.lbl_hostname.pack(side="right", padx=12)
-        tk.Label(
-            bar,
-            text="● raw sockets" if self._raw_ok else "○ unprivileged",
-            bg=C["header_bg"],
-            fg=C["green"] if self._raw_ok else C["text3"],
-            font=FONT_MONO_SM,
-        ).pack(side="right", padx=4)
-
-    @staticmethod
-    def _local_host_info() -> str:
-        name = socket.gethostname()
-        try:
-            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
-                s.connect(("192.0.2.1", 9))  # no packet is sent for UDP connect
-                ip = s.getsockname()[0]
-        except OSError:
-            ip = "127.0.0.1"
-        return f"local: {name} ({ip})"
-
     # ─────────────────────────── HELPERS ───────────────────────────
 
-    def _make_button(self, parent, text, command, fg=None, bg=None, hover_bg=None, pad=(12, 6)):
-        return _FlatButton(
-            parent,
+    def _make_button(self, text, command, fg=None, bg=None, hover_bg=None, pad=(12, 6)):
+        return FlatButton(
             text,
             command,
             fg=fg or C["text"],
@@ -1916,41 +1301,33 @@ class NexScanApp(tk.Tk):
             pad=pad,
         )
 
-    def _section(self, parent, title):
-        outer = tk.Frame(parent, bg=C["surface"])
-        outer.pack(fill="x", padx=4, pady=3)
-
-        # Section header
-        hdr = tk.Frame(outer, bg=C["accent_dim"])
-        hdr.pack(fill="x")
-        tk.Frame(hdr, bg=C["accent"], width=3).pack(side="left", fill="y")
-        tk.Label(
-            hdr,
-            text=f" {title}",
-            bg=C["accent_dim"],
-            fg=C["accent"],
-            font=FONT_MONO_SM,
-            anchor="w",
-            pady=3,
-        ).pack(fill="x", side="left")
-
-        # Content area
-        content = tk.Frame(
-            outer, bg=C["surface2"], highlightthickness=1, highlightbackground=C["border"]
+    def _ask_yes_no(self, title: str, text: str, warning: bool = True) -> bool:
+        box = QMessageBox(
+            QMessageBox.Icon.Warning if warning else QMessageBox.Icon.Question,
+            title,
+            text,
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            self,
         )
-        content.pack(fill="x", pady=1)
-        tk.Frame(content, bg=C["surface2"], height=4).pack(fill="x")
-        return content
+        box.setDefaultButton(QMessageBox.StandardButton.Yes)
+        return box.exec() == QMessageBox.StandardButton.Yes
+
+    def _show_error(self, title: str, text: str):
+        QMessageBox.critical(self, title, text)
 
     _LOG_MAX_LINES = 5000
 
     def _log_visible(self, tag: str) -> bool:
-        level = self.var_log_level.get() if hasattr(self, "var_log_level") else "All"
+        level = self._log_level
         if level == "Open":
             return tag in ("open", "banner", "ssl", "host")
         if level == "Error":
             return tag == "error"
         return True
+
+    def _on_log_level(self, button: QRadioButton):
+        self._log_level = button.property("level") or "All"
+        self._rerender_log()
 
     def _log(self, msg: str, tag: str = "info"):
         """Append to the live log. Safe to call from any thread."""
@@ -1958,71 +1335,45 @@ class NexScanApp(tk.Tk):
             self._ui_queue.put(("log", msg, tag))
             return
         ts = datetime.datetime.now().strftime("%H:%M:%S")
-        if not hasattr(self, "_log_entries"):
-            from collections import deque
-
-            self._log_entries = deque(maxlen=self._LOG_MAX_LINES)
         self._log_entries.append((ts, msg, tag))
-        if self._log_visible(tag):
+        if self._log_visible(tag) and hasattr(self, "txt_log"):
             self._insert_log_line(ts, msg, tag)
 
     def _insert_log_line(self, ts: str, msg: str, tag: str):
-        self.txt_log.configure(state="normal")
-        self.txt_log.insert("end", f"[{ts}] ", "timestamp")
-        self.txt_log.insert("end", f"{msg}\n", tag)
-        lines = int(self.txt_log.index("end-1c").split(".")[0])
-        if lines > self._LOG_MAX_LINES:
-            self.txt_log.delete("1.0", f"{lines - self._LOG_MAX_LINES}.0")
-        if self.var_autoscroll.get():
-            self.txt_log.see("end")
-        self.txt_log.configure(state="disabled")
+        self.txt_log.write(f"[{ts}] ", "timestamp")
+        self.txt_log.write(f"{msg}\n", tag)
+        if self.chk_autoscroll.isChecked():
+            self.txt_log.scroll_to_end()
 
     def _rerender_log(self):
-        self.txt_log.configure(state="normal")
-        self.txt_log.delete("1.0", "end")
-        self.txt_log.configure(state="disabled")
-        for ts, msg, tag in getattr(self, "_log_entries", []):
+        self.txt_log.setUpdatesEnabled(False)
+        self.txt_log.clear_text()
+        for ts, msg, tag in self._log_entries:
             if self._log_visible(tag):
-                self._insert_log_line(ts, msg, tag)
+                self.txt_log.write(f"[{ts}] ", "timestamp")
+                self.txt_log.write(f"{msg}\n", tag)
+        self.txt_log.setUpdatesEnabled(True)
+        if self.chk_autoscroll.isChecked():
+            self.txt_log.scroll_to_end()
 
-    def _set_status(self, text: str, color: str = None):
+    def _set_status(self, text: str, color: Optional[str] = None):
         color = color or C["text2"]
-        self.lbl_status.configure(text=text, fg=color)
-        self.status_strip.configure(bg=color)
-        self.lbl_statusbar.configure(text=text)
+        self.lbl_status.setText(text)
+        set_fg(self.lbl_status, color)
+        self.status_strip.setStyleSheet(f"background: {color};")
+        self.lbl_statusbar.setText(text)
 
     def _set_current(self, text: str):
-        self.lbl_current.configure(text=text)
+        self.lbl_current.setText(text)
 
     def _toast(self, message: str, kind: str = "info", ms: int = 3200):
         """Non-blocking notification in the bottom-right corner."""
-        colors = {
-            "ok": (C["green"], C["green_dim"]),
-            "warn": (C["yellow"], C["yellow_dim"]),
-            "error": (C["red"], C["red_dim"]),
-            "info": (C["accent"], C["accent_dim"]),
-        }
-        fg, bg = colors.get(kind, colors["info"])
-        icon = {"ok": "✓", "warn": "!", "error": "✗"}.get(kind, "◈")
+        self._toast_widget.show_message(message, kind, ms)
 
-        old = getattr(self, "_toast_widget", None)
-        if old is not None:
-            old.destroy()
-        toast = tk.Frame(self, bg=fg, padx=1, pady=1)
-        tk.Label(
-            toast,
-            text=f"  {icon}  {message}  ",
-            bg=bg,
-            fg=fg,
-            font=FONT_MONO_SM,
-            pady=8,
-            padx=6,
-        ).pack()
-        toast.place(relx=1.0, rely=1.0, x=-18, y=-36, anchor="se")
-        toast.lift()
-        toast.bind("<Button-1>", lambda e: toast.destroy())
-        self._toast_widget = toast
-        self.after(ms, lambda: toast.winfo_exists() and toast.destroy())
+    def _copy_to_clipboard(self, text: str):
+        cb = QApplication.clipboard()
+        if cb is not None:
+            cb.setText(text)
 
     # ─────────────────────────── SCAN CONTROL ───────────────────────────
 
@@ -2037,45 +1388,48 @@ class NexScanApp(tk.Tk):
         "Window*": ScanType.WINDOW,
     }
 
+    def _targets_text(self) -> str:
+        return self.txt_targets.toPlainText().strip()
+
+    def _ports_text(self) -> str:
+        return self.txt_ports.toPlainText().strip()
+
     def _get_scan_config(self) -> ScanConfig:
         """Build ScanConfig from UI state."""
-        target_text = self.txt_targets.get("1.0", "end").strip()
-        port_text = self.txt_ports.get("1.0", "end").strip().replace("\n", ",")
-
-        targets = parse_targets(target_text)
-        ports = parse_ports(port_text)
+        targets = parse_targets(self._targets_text())
+        ports = parse_ports(self._ports_text().replace("\n", ","))
 
         if not targets:
             raise ValueError("No valid targets specified.")
         if not ports:
             raise ValueError("No valid ports specified.")
 
-        stype = self._SCAN_TYPE_MAP.get(self.var_scan_type.get(), ScanType.TCP_CONNECT)
+        stype = self._SCAN_TYPE_MAP.get(self._scan_type(), ScanType.TCP_CONNECT)
         if stype in RAW_SCAN_TYPES and not self._raw_ok:
             raise ValueError(self._raw_reason or "Raw scans are not available.")
 
         try:
-            threads = max(1, min(1000, int(self.var_threads.get())))
+            threads = max(1, min(1000, int(self.sp_threads.value())))
             return ScanConfig(
                 targets=targets,
                 ports=ports,
                 scan_type=stype,
                 threads=threads,
-                timeout=max(0.05, float(self.var_timeout.get())),
-                connect_timeout=max(0.05, float(self.var_connect_timeout.get())),
-                grab_banners=self.var_banner_grab.get(),
-                detect_service=self.var_service_detect.get(),
-                detect_os=self.var_os_detect.get(),
-                ssl_probe=self.var_ssl_probe.get(),
-                rate_limit=max(0.0, float(self.var_rate_limit.get())) / 1000.0,
-                retry_count=max(1, int(self.var_retry.get())),
-                jitter=max(0.0, float(self.var_jitter.get())),
-                max_banner_wait=max(0.1, float(self.var_max_banner.get())),
-                host_discovery=self.var_host_discovery.get(),
-                udp_payload_probes=self.var_udp_probes.get(),
-                reverse_dns=self.var_quick_resolve.get(),
+                timeout=max(0.05, float(self.sp_timeout.value())),
+                connect_timeout=max(0.05, float(self.sp_connect_timeout.value())),
+                grab_banners=self.chk_banner_grab.isChecked(),
+                detect_service=self.chk_service_detect.isChecked(),
+                detect_os=self.chk_os_detect.isChecked(),
+                ssl_probe=self.chk_ssl_probe.isChecked(),
+                rate_limit=max(0.0, float(self.sp_rate_limit.value())) / 1000.0,
+                retry_count=max(1, int(self.sp_retry.value())),
+                jitter=max(0.0, float(self.sp_jitter.value())),
+                max_banner_wait=max(0.1, float(self.sp_max_banner.value())),
+                host_discovery=self.chk_host_discovery.isChecked(),
+                udp_payload_probes=self.chk_udp_probes.isChecked(),
+                reverse_dns=self.chk_quick_resolve.isChecked(),
             )
-        except (tk.TclError, ValueError) as e:
+        except (TypeError, ValueError) as e:
             raise ValueError(f"Invalid numeric setting: {e}") from e
 
     def _start_scan(self):
@@ -2085,17 +1439,16 @@ class NexScanApp(tk.Tk):
         try:
             config = self._get_scan_config()
         except ValueError as e:
-            messagebox.showerror("Configuration Error", str(e))
+            self._show_error("Configuration Error", str(e))
             return
 
         # Confirm large scans
         total = len(config.targets) * len(config.ports)
         if total > 500_000:
-            ok = messagebox.askyesno(
+            ok = self._ask_yes_no(
                 "Large Scan",
                 f"This scan covers {total:,} port/host combinations.\n"
                 "This may take a long time. Continue?",
-                icon="warning",
             )
             if not ok:
                 return
@@ -2108,7 +1461,7 @@ class NexScanApp(tk.Tk):
         self._pause_started = None
         self._update_controls()
 
-        self.stat_total_ports.set(total)
+        self._stat_total_ports = total
         self._set_status("SCANNING", C["green"])
         self._log(
             f"Starting {config.scan_type.value} scan on {len(config.targets)} "
@@ -2131,6 +1484,7 @@ class NexScanApp(tk.Tk):
         self.scan_thread = threading.Thread(target=self._run_scan, daemon=True)
         self.scan_thread.start()
         self._update_timer()
+        self._elapsed_timer.start(1000)
 
     def _run_scan(self):
         try:
@@ -2161,10 +1515,7 @@ class NexScanApp(tk.Tk):
     def _stop_scan(self):
         if not self.is_scanning:
             return
-        # Ask for confirmation
-        ok = messagebox.askyesno(
-            "Cancel Scan", "Are you sure you want to cancel the scan?", icon="warning"
-        )
+        ok = self._ask_yes_no("Cancel Scan", "Are you sure you want to cancel the scan?")
         if ok and self.scanner:
             self.scanner.stop()
             self.is_paused = False
@@ -2181,8 +1532,8 @@ class NexScanApp(tk.Tk):
             paused += time.time() - self._pause_started
         return max(0.0, time.time() - self.scan_start_time - paused)
 
+    # Scanner callbacks (run on the scan thread → queue)
     def _on_port_found(self, target: str, port_result: PortResult):
-        """Called from scan thread when an open port is found."""
         self._ui_queue.put(("port_found", target, port_result))
 
     def _on_progress(
@@ -2194,7 +1545,7 @@ class NexScanApp(tk.Tk):
         self._ui_queue.put(("host_complete", result))
 
     def _poll_queue(self):
-        """Process UI queue messages (called from main thread).
+        """Process UI queue messages (runs on the GUI thread every 30 ms).
 
         Progress updates arrive once per probed port; only the latest one per
         poll is rendered, and work per tick is time-boxed to keep the UI fluid.
@@ -2212,7 +1563,6 @@ class NexScanApp(tk.Tk):
             pass
         if last_progress is not None:
             self._handle_queue_msg(last_progress)
-        self.after(30, self._poll_queue)
 
     def _handle_queue_msg(self, msg):
         kind = msg[0]
@@ -2243,21 +1593,21 @@ class NexScanApp(tk.Tk):
         elif kind == "progress":
             _, done, total, target, hdone, htotal = msg
             pct = done / total * 100 if total else 0
-            self.progress["value"] = pct
-            self.lbl_progress.configure(text=f"{int(pct)}%")
-            self.stat_ports_done.set(done)
+            self.progress.setValue(int(pct * 10))
+            self.lbl_progress.setText(f"{int(pct)}%")
+            self.card_ports_done.set_value(done)
             self._set_current(f"{target} [{hdone}/{htotal}]")
-            self.title(f"NexScan — {int(pct)}% scanning…")
+            self.setWindowTitle(f"NexScan — {int(pct)}% scanning…")
 
             # ETA / throughput (paused time excluded)
             elapsed = self._active_elapsed()
             if done > 0 and total > 0 and self.is_scanning and elapsed > 0:
                 rate = done / elapsed
                 remaining = (total - done) / rate if rate > 0 else 0
-                self.stat_eta.set(self._fmt_duration(remaining))
-                self.lbl_rate.configure(text=f"{rate:,.0f} p/s")
+                self.lbl_eta.setText(self._fmt_duration(remaining))
+                self.lbl_rate.setText(f"{rate:,.0f} p/s")
             else:
-                self.stat_eta.set("—")
+                self.lbl_eta.setText("—")
 
         elif kind == "host_complete":
             _, result = msg
@@ -2285,45 +1635,47 @@ class NexScanApp(tk.Tk):
             stopped = self.scanner.is_stopped() if self.scanner else False
             self.is_scanning = False
             self.is_paused = False
+            self._elapsed_timer.stop()
             self._update_controls()
-            self.title(f"NexScan v{self.VERSION} — Advanced Port Scanner")
+            self.setWindowTitle(f"NexScan v{self.VERSION} — Advanced Port Scanner")
             self._set_status(
                 "STOPPED" if stopped else "COMPLETE", C["red"] if stopped else C["accent"]
             )
             elapsed = self._active_elapsed()
             self._log(
                 f"Scan {'stopped' if stopped else 'complete'} in {elapsed:.1f}s  "
-                f"Open:{self.stat_open.get()}  "
-                f"Filtered:{self.stat_filtered.get()}  "
-                f"Hosts up:{self.stat_hosts_up.get()}",
+                f"Open:{self.card_open.get()}  "
+                f"Filtered:{self.card_filtered.get()}  "
+                f"Hosts up:{self.card_hosts_up.get()}",
                 "info",
             )
             if not stopped:
-                self.progress["value"] = 100
-                self.lbl_progress.configure(text="100%")
-            self.stat_eta.set("—")
+                self.progress.setValue(1000)
+                self.lbl_progress.setText("100%")
+            self.lbl_eta.setText("—")
             self._recount_stats()
             self._update_host_list()
             self._update_stats_tab()
             self._refresh_results_view()  # apply sort order to rows streamed live
-            if self.var_autosave.get():
+            if self.chk_autosave.isChecked():
                 self._save_current_to_history(quiet=True)
             self._toast(
                 f"Scan {'stopped' if stopped else 'complete'} — "
-                f"{self.stat_open.get()} open port(s) on {self.stat_hosts_up.get()} host(s)",
+                f"{self.card_open.get()} open port(s) on {self.card_hosts_up.get()} host(s)",
                 "warn" if stopped else "ok",
             )
-            self.bell()
+            QApplication.beep()
 
         elif kind == "scan_error":
             _, err = msg
             self.is_scanning = False
             self.is_paused = False
+            self._elapsed_timer.stop()
             self._update_controls()
-            self.title(f"NexScan v{self.VERSION} — Advanced Port Scanner")
+            self.setWindowTitle(f"NexScan v{self.VERSION} — Advanced Port Scanner")
             self._set_status("ERROR", C["red"])
             self._log(f"Scan error: {err}", "error")
-            messagebox.showerror("Scan Error", str(err))
+            self._show_error("Scan Error", str(err))
 
         elif kind == "log":
             _, text, tag = msg
@@ -2337,7 +1689,7 @@ class NexScanApp(tk.Tk):
             self._vuln_write(text, tag)
 
         elif kind == "vuln_status":
-            self.lbl_vuln_status.configure(text=msg[1])
+            self.lbl_vuln_status.setText(msg[1])
 
         elif kind == "vuln_done":
             _, summary, count = msg
@@ -2359,7 +1711,7 @@ class NexScanApp(tk.Tk):
 
     @staticmethod
     def _row_key(target: str, pr: PortResult) -> str:
-        return f"{target}|{pr.protocol}|{pr.port}"
+        return row_key(target, pr)
 
     def _ingest_host_result(self, result: ScanResult):
         """Record a finished host: keep it in scan_results and store all its rows."""
@@ -2374,7 +1726,7 @@ class NexScanApp(tk.Tk):
             self._store_row(result.target, pr)
 
     def _store_row(self, target: str, pr: PortResult):
-        key = self._row_key(target, pr)
+        key = row_key(target, pr)
         is_new = key not in self._rows
         self._rows[key] = (target, pr)
         if is_new:
@@ -2382,70 +1734,59 @@ class NexScanApp(tk.Tk):
 
     def _recount_stats(self):
         counts = self._live_counts.values()
-        self.stat_open.set(sum(c.get("open", 0) for c in counts))
-        self.stat_filtered.set(sum(c.get("filtered", 0) for c in counts))
-        self.stat_hosts_up.set(sum(c.get("up", 0) for c in counts))
+        self.card_open.set_value(sum(c.get("open", 0) for c in counts))
+        self.card_filtered.set_value(sum(c.get("filtered", 0) for c in counts))
+        self.card_hosts_up.set_value(sum(c.get("up", 0) for c in counts))
 
     def _schedule_stats_refresh(self):
         """Statistics are rebuilt at most twice a second while hosts complete."""
-        if getattr(self, "_stats_job", None):
-            return
+        if not self._stats_timer.isActive():
+            self._stats_timer.start(500)
 
-        def run():
-            self._stats_job = None
-            self._update_stats_tab()
-
-        self._stats_job = self.after(500, run)
-
-    def _state_tag(self, pr: PortResult):
-        """Tree tag for a port, or None if hidden by the show-filtered/closed toggles."""
+    def _state_tag(self, pr: PortResult) -> Optional[str]:
+        """Row colour tag for a port, or None if hidden by the show-filtered/closed toggles."""
         if pr.state == PortState.OPEN:
             if pr.ssl_info and pr.ssl_info.get("expired"):
                 return "warn"
             return "open"
         if pr.state in (PortState.FILTERED, PortState.OPEN_FILTERED):
-            return "filtered" if self.var_show_filtered.get() else None
-        return "closed" if self.var_show_closed.get() else None
+            return "filtered" if self.chk_show_filtered.isChecked() else None
+        return "closed" if self.chk_show_closed.isChecked() else None
 
-    def _compile_filter(self):
+    def _set_filter_border(self, color: Optional[str]):
+        self.entry_filter.setStyleSheet(
+            "" if color is None else f"QLineEdit {{ border: 1px solid {color}; }}"
+        )
+
+    def _compile_filter(self) -> Optional[Callable[[str], bool]]:
         """Return a predicate for the filter box (None = no filter)."""
-        ftext = self.var_filter_text.get().strip().lower()
+        ftext = self.entry_filter.text().strip().lower()
         if not ftext:
-            self.entry_filter.configure(highlightbackground=C["border2"])
+            self._set_filter_border(None)
             return None
-        if self.var_filter_regex.get():
+        if self.chk_filter_regex.isChecked():
             try:
                 rx = re.compile(ftext, re.IGNORECASE)
             except re.error:
-                self.entry_filter.configure(highlightbackground=C["red"])
+                self._set_filter_border(C["red"])
                 return lambda row: True
-            self.entry_filter.configure(highlightbackground=C["accent2"])
+            self._set_filter_border(C["accent2"])
             return lambda row: bool(rx.search(row))
-        self.entry_filter.configure(highlightbackground=C["accent2"])
+        self._set_filter_border(C["accent2"])
         terms = ftext.split()
         return lambda row: all(t in row for t in terms)
 
     @staticmethod
     def _row_values(target: str, pr: PortResult) -> tuple:
-        banner_short = pr.banner.splitlines()[0][:80] if pr.banner else ""
-        return (
-            target,
-            pr.port,
-            pr.protocol.upper(),
-            pr.state.value,
-            pr.service,
-            pr.version,
-            f"{pr.response_time * 1000:.1f}",
-            banner_short,
-        )
+        return row_values(target, pr)
 
     def _row_passes(self, target: str, pr: PortResult, predicate) -> bool:
-        host_filter = self.var_host_filter.get()
+        host_filter = self.cb_host_filter.currentText() or "All"
         if host_filter != "All" and target != host_filter:
             return False
         if predicate is None:
             return True
-        values = self._row_values(target, pr)
+        values = row_values(target, pr)
         return predicate(" ".join(str(v) for v in values).lower())
 
     def _add_result_row(self, target: str, pr: PortResult):
@@ -2453,65 +1794,60 @@ class NexScanApp(tk.Tk):
         tag = self._state_tag(pr)
         if tag is None or not self._row_passes(target, pr, self._compile_filter()):
             return
-        iid = self._row_key(target, pr)
-        if self.tree.exists(iid):
-            return
-        stripe = "even" if self._row_counter % 2 == 0 else "odd"
-        self._row_counter += 1
-        self.tree.insert(
-            "", "end", iid=iid, values=self._row_values(target, pr), tags=(tag, stripe)
-        )
-        self._update_result_count()
+        if self.results_model.append_row(target, pr, tag):
+            self._update_result_count()
 
     def _update_result_count(self):
-        n = len(self.tree.get_children())
-        self.lbl_result_count.configure(text=f"{n:,} result{'s' if n != 1 else ''}")
-        if n:
-            self.lbl_empty.place_forget()
-        else:
-            self.lbl_empty.place(relx=0.5, rely=0.45, anchor="center")
+        n = self.results_model.rowCount()
+        self.lbl_result_count.setText(f"{n:,} result{'s' if n != 1 else ''}")
+        self.lbl_empty.setVisible(n == 0)
 
     def _update_timer(self):
         if not self.is_scanning:
+            self._elapsed_timer.stop()
             return
         if not self.is_paused:
             elapsed = int(self._active_elapsed())
             h, m, s = elapsed // 3600, (elapsed % 3600) // 60, elapsed % 60
-            self.lbl_timer.configure(text=f"{h:02d}:{m:02d}:{s:02d}", fg=C["accent"])
-            self.lbl_timer_icon.configure(fg=C["accent"])
-        self.after(1000, self._update_timer)
+            self.lbl_timer.setText(f"{h:02d}:{m:02d}:{s:02d}")
+            set_fg(self.lbl_timer, C["accent"])
+            set_fg(self.lbl_timer_icon, C["accent"])
 
     def _update_host_list(self):
-        hosts = ["All"] + [r.target for r in self.scan_results]
-        self.cb_host_filter["values"] = hosts
+        current = self.cb_host_filter.currentText() or "All"
+        self.cb_host_filter.blockSignals(True)
+        self.cb_host_filter.clear()
+        self.cb_host_filter.addItems(["All"] + [r.target for r in self.scan_results])
+        idx = self.cb_host_filter.findText(current)
+        self.cb_host_filter.setCurrentIndex(max(0, idx))
+        self.cb_host_filter.blockSignals(False)
 
-        self.host_listbox.delete(0, "end")
-        for i, r in enumerate(self.scan_results):
+        selected = self.host_listbox.currentRow()
+        self.host_listbox.blockSignals(True)
+        self.host_listbox.clear()
+        for r in self.scan_results:
             status = "▲" if r.host_up else "▼"
-            self.host_listbox.insert("end", f"{status} {r.target}  [{r.open_count} open]")
+            item = QListWidgetItem(f"{status} {r.target}  [{r.open_count} open]")
             color = (
                 C["green"]
                 if r.host_up and r.open_count
                 else (C["text"] if r.host_up else C["text3"])
             )
-            self.host_listbox.itemconfigure(i, foreground=color)
+            item.setForeground(QColor(color))
+            self.host_listbox.addItem(item)
+        if 0 <= selected < self.host_listbox.count():
+            self.host_listbox.setCurrentRow(selected)
+        self.host_listbox.blockSignals(False)
 
-    def _on_host_select(self, event):
-        sel = self.host_listbox.curselection()
-        if not sel:
-            return
-        idx = sel[0]
-        if idx < len(self.scan_results):
+    def _on_host_select(self, idx: int):
+        if 0 <= idx < len(self.scan_results):
             self._show_host_detail(self.scan_results[idx])
 
     def _show_host_detail(self, result: ScanResult):
         """Show detailed info for a host in the detail tab."""
         dt = self.detail_text
-        dt.configure(state="normal")
-        dt.delete("1.0", "end")
-
-        def w(text, tag=None):
-            dt.insert("end", text, tag)
+        dt.clear_text()
+        w = dt.write
 
         sep = "─" * 68 + "\n"
         w("◈ HOST REPORT\n", "header")
@@ -2592,21 +1928,16 @@ class NexScanApp(tk.Tk):
             if len(filt_ports) > 50:
                 ports_str += f" ... (+{len(filt_ports) - 50} more)"
             w(f"  {ports_str}\n", "filtered")
-
-        dt.configure(state="disabled")
+        dt.scroll_to_top()
 
     def _update_stats_tab(self):
         """Update the statistics tab with current scan data."""
         st = self.stats_text
-        st.configure(state="normal")
-        st.delete("1.0", "end")
-
-        def w(text, tag=None):
-            st.insert("end", text, tag)
+        st.clear_text()
+        w = st.write
 
         if not self.scan_results:
             w("  No scan data available yet.\n", "key")
-            st.configure(state="disabled")
             return
 
         sep = "─" * 60 + "\n"
@@ -2615,8 +1946,8 @@ class NexScanApp(tk.Tk):
         w(sep, "sep")
 
         all_open = []
-        service_counts = defaultdict(int)
-        port_counts = defaultdict(int)
+        service_counts: dict = defaultdict(int)
+        port_counts: dict = defaultdict(int)
         for r in self.scan_results:
             for p in r.ports:
                 if p.state == PortState.OPEN:
@@ -2637,16 +1968,15 @@ class NexScanApp(tk.Tk):
         w("  Open Ports Found  : ", "key")
         w(f"{len(all_open)}\n", "val")
         w("  Filtered Ports    : ", "key")
-        w(f"{self.stat_filtered.get()}\n", "val")
+        w(f"{self.card_filtered.get()}\n", "val")
 
-        if self.scan_results:
-            total_dur = sum(r.scan_duration for r in self.scan_results)
-            w("  Total Scan Time   : ", "key")
-            w(f"{total_dur:.2f}s\n", "val")
-            if total_scanned > 0:
-                rate = total_scanned / max(total_dur, 0.01)
-                w("  Avg Port Rate     : ", "key")
-                w(f"{rate:.0f} ports/sec\n", "val")
+        total_dur = sum(r.scan_duration for r in self.scan_results)
+        w("  Total Scan Time   : ", "key")
+        w(f"{total_dur:.2f}s\n", "val")
+        if total_scanned > 0:
+            rate = total_scanned / max(total_dur, 0.01)
+            w("  Avg Port Rate     : ", "key")
+            w(f"{rate:.0f} ports/sec\n", "val")
 
         if service_counts:
             w("\n")
@@ -2672,7 +2002,7 @@ class NexScanApp(tk.Tk):
                 w(f"  {port:<8} {svc:<18} {count:>6}\n", "val")
 
         # OS distribution
-        os_counts = defaultdict(int)
+        os_counts: dict = defaultdict(int)
         for r in self.scan_results:
             if r.os_guess:
                 os_counts[r.os_guess] += 1
@@ -2687,16 +2017,13 @@ class NexScanApp(tk.Tk):
                 bar = "█" * bar_len
                 w(f"  {os_name:<25}", "key")
                 w(f"{bar}  {count}\n", "val")
-
-        st.configure(state="disabled")
+        st.scroll_to_top()
 
     # ─────────────────────────── FILTER & SORT ───────────────────────────
 
     def _apply_filter(self, *args):
         """Debounced: typing in the filter box rebuilds the view once typing pauses."""
-        if self._refresh_job is not None:
-            self.after_cancel(self._refresh_job)
-        self._refresh_job = self.after(120, self._refresh_results_view)
+        self._refresh_timer.start(120)
 
     _SORT_KEYS = {
         "host": lambda t, p: t,
@@ -2714,9 +2041,8 @@ class NexScanApp(tk.Tk):
         self._refresh_results_view()
 
     def _refresh_results_view(self):
-        """Rebuild the treeview from the live row store with current filters/sort."""
-        self._refresh_job = None
-        self.tree.delete(*self.tree.get_children())
+        """Rebuild the table from the live row store with current filters/sort."""
+        self._refresh_timer.stop()
         predicate = self._compile_filter()
 
         all_rows = []
@@ -2732,7 +2058,7 @@ class NexScanApp(tk.Tk):
             key = self._SORT_KEYS.get(col, self._SORT_KEYS["port"])
             all_rows.sort(key=lambda x: (key(x[0], x[1]), x[1].port), reverse=desc)
         else:
-            sort_val = self.var_sort.get()
+            sort_val = self.cb_sort.currentText()
             if sort_val == "Port ↓":
                 all_rows.sort(key=lambda x: (-x[1].port, x[0]))
             elif sort_val == "Service":
@@ -2744,16 +2070,8 @@ class NexScanApp(tk.Tk):
             else:  # Port ↑
                 all_rows.sort(key=lambda x: (x[1].port, x[0]))
 
-        for i, (target, p, tag) in enumerate(all_rows):
-            self.tree.insert(
-                "",
-                "end",
-                iid=self._row_key(target, p),
-                values=self._row_values(target, p),
-                tags=(tag, "even" if i % 2 == 0 else "odd"),
-            )
-        self._row_counter = len(all_rows)
-        self._update_heading_arrows()
+        self.results_model.set_rows(all_rows)
+        self.results_model.set_sort_indicator(self._header_sort)
         self._update_result_count()
 
     def _sort_tree(self, col: str):
@@ -2764,121 +2082,110 @@ class NexScanApp(tk.Tk):
             self._header_sort = (col, False)
         self._refresh_results_view()
 
-    def _update_heading_arrows(self):
-        for col, label in self._col_labels.items():
-            text = label
-            if self._header_sort and self._header_sort[0] == col:
-                text += "  ▼" if self._header_sort[1] else "  ▲"
-            self.tree.heading(col, text=text)
-
     # ─────────────────────────── EXPORT ───────────────────────────
 
     def _export_menu(self):
-        menu = tk.Menu(
-            self,
-            tearoff=0,
-            bg=C["surface2"],
-            fg=C["text"],
-            activebackground=C["select"],
-            activeforeground=C["white"],
-            font=FONT_MONO_SM,
-            bd=0,
-            relief="solid",
-        )
-        for fmt, (_fn, _ext, label) in EXPORTERS.items():
-            menu.add_command(label=f"Export as {label}", command=lambda f=fmt: self._export(f))
-
-        menu.add_separator()
-        menu.add_command(label="Copy visible results", command=self._copy_results)
-        menu.add_command(label="Save to history", command=self._save_current_to_history)
-        try:
-            menu.tk_popup(self.winfo_pointerx(), self.winfo_pointery())
-        finally:
-            menu.grab_release()
+        menu = QMenu(self)
+        for fmt, (_fn, _ext, lbl) in EXPORTERS.items():
+            menu.addAction(f"Export as {lbl}", lambda f=fmt: self._export(f))
+        menu.addSeparator()
+        menu.addAction("Copy visible results", self._copy_results)
+        menu.addAction("Save to history", self._save_current_to_history)
+        menu.exec(QCursor.pos())
 
     def _export(self, fmt: str):
         if not self.scan_results:
             self._toast("No scan results to export", "warn")
             return
 
-        fn, ext, label = EXPORTERS[fmt]
+        fn, ext, lbl = EXPORTERS[fmt]
         ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        path = filedialog.asksaveasfilename(
-            defaultextension=ext,
-            filetypes=[(f"{label} files", f"*{ext}"), ("All Files", "*.*")],
-            initialfile=f"nexscan_{ts}{ext}",
+        path, _ = QFileDialog.getSaveFileName(
+            self,
+            f"Export {lbl}",
+            f"nexscan_{ts}{ext}",
+            f"{lbl} files (*{ext});;All Files (*)",
         )
         if not path:
             return
+        if not os.path.splitext(path)[1]:
+            path += ext
 
         try:
             with open(path, "w", encoding="utf-8") as f:
                 f.write(fn(self.scan_results))
-            self._log(f"Exported {label} report to: {path}", "info")
+            self._log(f"Exported {lbl} report to: {path}", "info")
             self._toast(f"Saved {os.path.basename(path)}", "ok")
-            if fmt == "html" and messagebox.askyesno(
-                "Export Successful", f"Report saved to:\n{path}\n\nOpen it in your browser?"
+            if fmt == "html" and self._ask_yes_no(
+                "Export Successful",
+                f"Report saved to:\n{path}\n\nOpen it in your browser?",
+                warning=False,
             ):
                 webbrowser.open(f"file://{os.path.abspath(path)}")
         except Exception as e:
-            messagebox.showerror("Export Error", str(e))
+            self._show_error("Export Error", str(e))
 
     def _copy_results(self):
-        self._copy_rows(self.tree.get_children(), "visible")
+        self._copy_rows(range(self.results_model.rowCount()), "visible")
+
+    def _selected_rows(self) -> list[int]:
+        sel = self.tree.selectionModel()
+        return sorted(i.row() for i in sel.selectedRows()) if sel else []
 
     def _copy_selected_rows(self):
-        sel = self.tree.selection()
-        self._copy_rows(sel or self.tree.get_children(), "selected" if sel else "visible")
+        sel = self._selected_rows()
+        self._copy_rows(
+            sel or range(self.results_model.rowCount()), "selected" if sel else "visible"
+        )
 
-    def _copy_rows(self, iids, what: str):
-        header = "\t".join(self._col_labels.values())
-        rows = [header]
-        for iid in iids:
-            values = self.tree.item(iid, "values")
-            rows.append("\t".join(str(v) for v in values))
-        self.clipboard_clear()
-        self.clipboard_append("\n".join(rows))
-        self._log(f"Copied {len(rows) - 1} rows to clipboard.", "info")
-        self._toast(f"Copied {len(rows) - 1} {what} row(s)", "ok")
+    def _copy_rows(self, rows, what: str):
+        lines = ["\t".join(COLUMN_LABELS)]
+        for r in rows:
+            lines.append("\t".join(str(v) for v in self.results_model.values_at(r)))
+        self._copy_to_clipboard("\n".join(lines))
+        self._log(f"Copied {len(lines) - 1} rows to clipboard.", "info")
+        self._toast(f"Copied {len(lines) - 1} {what} row(s)", "ok")
 
     # ─────────────────────────── MISC ───────────────────────────
 
     def _apply_port_preset(self, event=None):
-        preset = self.var_port_preset.get()
+        preset = self.cb_preset.currentText()
         ports = self.service_db.get_preset_ports(preset)
         if ports:
-            self.txt_ports.delete("1.0", "end")
-            self.txt_ports.insert("1.0", ",".join(str(p) for p in ports))
+            self.txt_ports.setPlainText(",".join(str(p) for p in ports))
             self._log(f"Applied preset '{preset}': {len(ports)} ports", "info")
             self._count_ports()
 
     def _count_ports(self):
-        port_text = self.txt_ports.get("1.0", "end").strip().replace("\n", ",")
+        ports: list = []
         try:
-            ports = parse_ports(port_text)
+            ports = parse_ports(self._ports_text().replace("\n", ","))
             text, color = f"Ports to scan: {len(ports):,}", C["green"] if ports else C["red"]
         except Exception:
             text, color = "Invalid port range", C["red"]
-        self.lbl_port_count.configure(text=text, fg=color)
-        self.lbl_port_summary.configure(
-            text=f"{len(ports):,} port{'s' if len(ports) != 1 else ''} to scan" if ports else text,
-            fg=C["text2"] if ports else color,
+        self.lbl_port_count.setText(text)
+        set_fg(self.lbl_port_count, color)
+        self.lbl_port_summary.setText(
+            f"{len(ports):,} port{'s' if len(ports) != 1 else ''} to scan" if ports else text
         )
+        set_fg(self.lbl_port_summary, C["text2"] if ports else color)
 
     def _count_targets(self):
-        targets = parse_targets(self.txt_targets.get("1.0", "end").strip())
+        try:
+            targets = parse_targets(self._targets_text())
+        except Exception:
+            targets = []
         n = len(targets)
         if not n:
-            self.lbl_target_summary.configure(text="No valid targets", fg=C["red"])
+            self.lbl_target_summary.setText("No valid targets")
+            set_fg(self.lbl_target_summary, C["red"])
             return
         preview = ", ".join(targets[:3]) + (" …" if n > 3 else "")
-        self.lbl_target_summary.configure(
-            text=f"{n:,} host{'s' if n != 1 else ''}: {preview}", fg=C["text2"]
-        )
+        self.lbl_target_summary.setText(f"{n:,} host{'s' if n != 1 else ''}: {preview}")
+        set_fg(self.lbl_target_summary, C["text2"])
 
     def _resolve_targets(self):
-        target_text = self.txt_targets.get("1.0", "end").strip()
-        targets = parse_targets(target_text)
+        targets = parse_targets(self._targets_text())
         self._log(f"Resolving {len(targets)} target(s)...", "info")
 
         def resolve():
@@ -2900,7 +2207,7 @@ class NexScanApp(tk.Tk):
 
     def _clear_results(self):
         if self.is_scanning:
-            messagebox.showwarning("Scan Running", "Stop the scan before clearing results.")
+            QMessageBox.warning(self, "Scan Running", "Stop the scan before clearing results.")
             return
         self._clear_results_internal()
 
@@ -2908,106 +2215,80 @@ class NexScanApp(tk.Tk):
         self.scan_results = []
         self._rows.clear()
         self._live_counts.clear()
-        self._row_counter = 0
-        self.tree.delete(*self.tree.get_children())
-        self.host_listbox.delete(0, "end")
-        self.cb_host_filter["values"] = ["All"]
-        self.var_host_filter.set("All")
-        self.stat_open.set(0)
-        self.stat_filtered.set(0)
-        self.stat_hosts_up.set(0)
-        self.stat_ports_done.set(0)
-        self.stat_eta.set("—")
-        self.progress["value"] = 0
-        self.lbl_progress.configure(text="0%")
-        self.lbl_rate.configure(text="")
-        self.lbl_timer.configure(text="00:00:00", fg=C["text3"])
-        self.lbl_timer_icon.configure(fg=C["text3"])
+        self.results_model.clear()
+        self.host_listbox.clear()
+        self.cb_host_filter.clear()
+        self.cb_host_filter.addItem("All")
+        for card in (self.card_open, self.card_filtered, self.card_hosts_up, self.card_ports_done):
+            card.set_value(0)
+        self.lbl_eta.setText("—")
+        self.progress.setValue(0)
+        self.lbl_progress.setText("0%")
+        self.lbl_rate.setText("")
+        self.lbl_timer.setText("00:00:00")
+        set_fg(self.lbl_timer, C["text3"])
+        set_fg(self.lbl_timer_icon, C["text3"])
         self._update_result_count()
         self._set_status("IDLE", C["text2"])
         self._set_current("—")
-
-        for widget in (self.stats_text, self.detail_text):
-            widget.configure(state="normal")
-            widget.delete("1.0", "end")
-            widget.configure(state="disabled")
+        self.detail_text.clear_text()
         self._update_stats_tab()
 
     def _clear_log(self):
-        self.txt_log.configure(state="normal")
-        self.txt_log.delete("1.0", "end")
-        self.txt_log.configure(state="disabled")
+        self.txt_log.clear_text()
 
     _WEB_SERVICES = ("http", "https", "http-proxy", "http-alt", "https-alt", "www")
 
-    def _tree_context_menu(self, event):
-        iid = self.tree.identify_row(event.y)
-        if not iid:
+    def _tree_context_menu(self, pos: QPoint):
+        index = self.tree.indexAt(pos)
+        if not index.isValid():
             return
-        if iid not in self.tree.selection():
-            self.tree.selection_set(iid)
-        self.tree.focus(iid)
+        sel = self.tree.selectionModel()
+        if sel is not None and not sel.isRowSelected(index.row(), index.parent()):
+            self.tree.selectRow(index.row())
+        self.tree.setCurrentIndex(index)
+        iid = self.results_model.key_at(index.row())
         entry = self._rows.get(iid)
         if not entry:
             return
         target, pr = entry
         host, port = target, pr.port
 
-        menu = tk.Menu(
-            self,
-            tearoff=0,
-            bg=C["surface2"],
-            fg=C["text"],
-            activebackground=C["select"],
-            activeforeground=C["white"],
-            font=FONT_MONO_SM,
-            bd=0,
-        )
-
-        menu.add_command(label="Show Port Detail", command=lambda: self._show_port_popup_for(iid))
+        menu = QMenu(self)
+        menu.addAction("Show Port Detail", lambda: self._show_port_popup_for(iid))
         if pr.state == PortState.OPEN and (
             pr.service in self._WEB_SERVICES or pr.service.startswith("http")
         ):
             scheme = "https" if pr.ssl_info or "https" in pr.service else "http"
             url = f"{scheme}://{host}:{port}/"
-            menu.add_command(label=f"Open {url}", command=lambda: webbrowser.open(url))
-        menu.add_separator()
-        menu.add_command(
-            label=f"Copy {host}:{port}", command=lambda: self._copy_text(f"{host}:{port}")
-        )
-        menu.add_command(label=f"Copy host {host}", command=lambda: self._copy_text(host))
+            menu.addAction(f"Open {url}", lambda: webbrowser.open(url))
+        menu.addSeparator()
+        menu.addAction(f"Copy {host}:{port}", lambda: self._copy_text(f"{host}:{port}"))
+        menu.addAction(f"Copy host {host}", lambda: self._copy_text(host))
         if pr.banner:
-            menu.add_command(label="Copy banner", command=lambda: self._copy_text(pr.banner))
-        sel = len(self.tree.selection())
-        menu.add_command(label=f"Copy {sel} selected row(s)", command=self._copy_selected_rows)
-        menu.add_separator()
-        menu.add_command(
-            label=f"Filter by port {port}", command=lambda: self.var_filter_text.set(str(port))
-        )
-        menu.add_command(
-            label=f"Filter by host {host}", command=lambda: self.var_filter_text.set(host)
-        )
+            menu.addAction("Copy banner", lambda: self._copy_text(pr.banner))
+        n_sel = len(self._selected_rows())
+        menu.addAction(f"Copy {n_sel} selected row(s)", self._copy_selected_rows)
+        menu.addSeparator()
+        menu.addAction(f"Filter by port {port}", lambda: self.entry_filter.setText(str(port)))
+        menu.addAction(f"Filter by host {host}", lambda: self.entry_filter.setText(host))
         if pr.service:
-            menu.add_command(
-                label=f"Filter by service {pr.service}",
-                command=lambda: self.var_filter_text.set(pr.service),
+            menu.addAction(
+                f"Filter by service {pr.service}", lambda: self.entry_filter.setText(pr.service)
             )
-        menu.add_command(label="Clear filter", command=lambda: self.var_filter_text.set(""))
-
-        try:
-            menu.tk_popup(event.x_root, event.y_root)
-        finally:
-            menu.grab_release()
+        menu.addAction("Clear filter", lambda: self.entry_filter.setText(""))
+        menu.exec(self.tree.viewport().mapToGlobal(pos))
 
     def _copy_text(self, text: str):
-        self.clipboard_clear()
-        self.clipboard_append(text)
+        self._copy_to_clipboard(text)
         self._toast("Copied to clipboard", "ok", ms=1500)
 
-    def _show_port_detail(self, event):
-        iid = self.tree.focus()
-        if iid:
-            self._show_port_popup_for(iid)
+    def _show_port_detail(self, event=None):
+        idx = self.tree.currentIndex()
+        if idx.isValid():
+            iid = self.results_model.key_at(idx.row())
+            if iid:
+                self._show_port_popup_for(iid)
 
     def _show_port_popup_for(self, iid: str):
         entry = self._rows.get(iid)
@@ -3024,298 +2305,110 @@ class NexScanApp(tk.Tk):
         proto = str(values[2]).lower() if len(values) > 2 else "tcp"
         self._show_port_popup_for(f"{host}|{proto}|{port_str}")
 
+    def _track_popup(self, dlg):
+        self._popups.append(dlg)
+        dlg.destroyed.connect(lambda *_: self._popups.remove(dlg) if dlg in self._popups else None)
+
     def _show_port_popup(self, result: ScanResult, pr: PortResult):
-        popup = tk.Toplevel(self)
-        popup.title(f"Port Detail — {result.target}:{pr.port}")
-        popup.configure(bg=C["bg"])
-        popup.geometry("640x520")
-        popup.resizable(True, True)
-        popup.transient(self)
-        popup.bind("<Escape>", lambda e: popup.destroy())
-
-        # Button row first so it stays visible when the text is long
-        btns = tk.Frame(popup, bg=C["bg"])
-        btns.pack(side="bottom", fill="x", pady=8)
-        self._make_button(btns, "  Close  ", popup.destroy).pack(side="right", padx=8)
-        self._make_button(
-            btns,
-            "Copy JSON",
-            lambda: self._copy_text(json.dumps(pr.to_dict(), indent=2)),
-            fg=C["accent"],
-        ).pack(side="right", padx=4)
-        if pr.banner:
-            self._make_button(
-                btns, "Copy Banner", lambda: self._copy_text(pr.banner), fg=C["orange"]
-            ).pack(side="right", padx=4)
-
-        txt = tk.Text(
-            popup,
-            bg=C["bg"],
-            fg=C["text"],
-            font=FONT_MONO_SM,
-            state="normal",
-            relief="flat",
-            padx=16,
-            pady=12,
-            wrap="word",
-        )
-        vsb = ttk.Scrollbar(popup, orient="vertical", command=txt.yview)
-        txt.configure(yscrollcommand=vsb.set)
-        vsb.pack(side="right", fill="y")
-        txt.pack(fill="both", expand=True)
-
-        for tag, fg_c in [
-            ("key", C["text2"]),
-            ("val", C["text"]),
-            ("open", C["green"]),
-            ("head", C["accent"]),
-            ("banner", C["orange"]),
-            ("ssl", C["accent2"]),
-            ("filtered", C["yellow"]),
-            ("closed", C["text3"]),
-            ("bad", C["red"]),
-        ]:
-            txt.tag_configure(tag, foreground=fg_c)
-        txt.tag_configure("bold", font=(FONT_MONO[0], 10, "bold"))
-        state_tag = {
-            PortState.OPEN: "open",
-            PortState.FILTERED: "filtered",
-            PortState.OPEN_FILTERED: "filtered",
-        }.get(pr.state, "closed")
-
-        def w(t, tag=None):
-            txt.insert("end", t, tag)
-
-        w("PORT DETAIL\n", "head")
-        w("─" * 50 + "\n", "key")
-        w("Host       : ", "key")
-        w(f"{result.target}\n", "val")
-        w("IP         : ", "key")
-        w(f"{result.ip_address}\n", "val")
-        w("Port       : ", "key")
-        w(f"{pr.port}/{pr.protocol.upper()}\n", "open")
-        w("State      : ", "key")
-        w(f"{pr.state.value}\n", state_tag)
-        w("Service    : ", "key")
-        w(f"{pr.service}\n", "val")
-        w("Version    : ", "key")
-        w(f"{pr.version}\n", "val")
-        if pr.cpe:
-            w("CPE        : ", "key")
-            w(f"{pr.cpe}\n", "val")
-        w("RTT        : ", "key")
-        w(f"{pr.response_time * 1000:.2f}ms\n", "val")
-        if pr.extra_info:
-            w("Notes      : ", "key")
-            w(f"{pr.extra_info}\n", "val")
-        w("\n")
-
-        if pr.banner:
-            w("BANNER\n", "head")
-            w("─" * 50 + "\n", "key")
-            w(pr.banner[:1000] + "\n", "banner")
-            w("\n")
-
-        if pr.ssl_info:
-            w("SSL/TLS INFO\n", "head")
-            w("─" * 50 + "\n", "key")
-            ssl = pr.ssl_info
-            labels = [
-                ("version", "Protocol"),
-                ("cipher", "Cipher"),
-                ("cipher_bits", "Key bits"),
-                ("common_name", "Common name"),
-                ("san", "Alt names"),
-                ("issuer", "Issuer"),
-                ("not_before", "Valid from"),
-                ("not_after", "Valid until"),
-                ("days_left", "Days left"),
-                ("self_signed", "Self-signed"),
-            ]
-            for key, label in labels:
-                if key not in ssl or ssl[key] in ("", None, []):
-                    continue
-                v = ssl[key]
-                if isinstance(v, list):
-                    v = ", ".join(v[:6]) + (" …" if len(v) > 6 else "")
-                tag = "ssl"
-                if key == "days_left" and isinstance(v, int) and v < 30:
-                    tag = "bad"
-                    v = f"{v}  ({'EXPIRED' if v < 0 else 'expires soon'})"
-                if key == "self_signed":
-                    v, tag = ("yes", "bad") if v else ("no", "ssl")
-                if key == "version" and str(v) in ("SSLv3", "TLSv1", "TLSv1.1"):
-                    tag = "bad"
-                    v = f"{v}  (deprecated)"
-                w(f"{label:<12}: ", "key")
-                w(f"{v}\n", tag)
-
-        txt.configure(state="disabled")
+        self._track_popup(dialogs.show_port_popup(self, result, pr, self._copy_text))
 
     def _show_about(self):
-        popup = tk.Toplevel(self)
-        popup.title("About NexScan")
-        popup.configure(bg=C["bg"])
-        popup.geometry("600x560")
-        popup.resizable(False, True)
-        popup.transient(self)
-        popup.bind("<Escape>", lambda e: popup.destroy())
-
-        btns = tk.Frame(popup, bg=C["bg"])
-        btns.pack(side="bottom", fill="x", pady=10)
-        self._make_button(btns, "  Close  ", popup.destroy).pack()
-
-        txt = tk.Text(
-            popup,
-            bg=C["bg"],
-            fg=C["text"],
-            font=FONT_MONO_SM,
-            state="normal",
-            relief="flat",
-            padx=24,
-            pady=20,
-            wrap="word",
-            highlightthickness=0,
-        )
-        txt.pack(fill="both", expand=True)
-
-        for tag, fg_c, fnt in [
-            ("h1", C["accent"], FONT_TITLE),
-            ("h2", C["purple"], FONT_MONO_LG),
-            ("key", C["text2"], FONT_MONO_SM),
-            ("kbd", C["accent"], FONT_MONO_SM),
-            ("val", C["text"], FONT_MONO_SM),
-        ]:
-            txt.tag_configure(tag, foreground=fg_c, font=fnt)
-        txt.tag_configure("h2", spacing1=10, spacing3=4)
-
-        txt.insert("end", "◈ NEXSCAN\n", "h1")
-        txt.insert("end", f"v{self.VERSION} — Advanced Port Scanner\n", "val")
-
-        txt.insert("end", "KEYBOARD SHORTCUTS\n", "h2")
-        for keys, desc in [
-            ("F5", "Start scan"),
-            ("F6", "Pause / resume"),
-            ("Escape", "Stop / cancel scan"),
-            ("Ctrl+E", "Export results"),
-            ("Ctrl+L", "Clear results"),
-            ("Ctrl+F", "Focus filter box"),
-            ("Ctrl+C", "Copy selected rows"),
-            ("Ctrl+S / Ctrl+O", "Save / load profile"),
-            ("Ctrl+H", "Scan history"),
-        ]:
-            txt.insert("end", f"  {keys:<18}", "kbd")
-            txt.insert("end", f"{desc}\n", "key")
-
-        txt.insert("end", "CAPABILITIES\n", "h2")
-        features = [
-            "TCP Connect, UDP and raw SYN / ACK / FIN / XMAS / NULL / Window scans",
-            "Shared worker pool across hosts with parallel host discovery",
-            "Protocol-aware banner grabbing & product/version fingerprinting",
-            "TLS certificate inspection with expiry warnings",
-            "Heuristic OS detection (TTL + port fingerprint)",
-            "CIDR, IP ranges and multi-host scanning",
-            "Live, filterable results with pause / resume and ETA",
-            "Export: JSON, CSV, HTML, XML, Markdown, TXT",
-            "Scan history with run-to-run diffs",
-            "CVE lookup (NVD) and geolocation / RDAP WHOIS",
-        ]
-        for f in features:
-            txt.insert("end", f"  ✓ {f}\n", "key")
-
-        txt.insert("end", "⚠ LEGAL NOTICE\n", "h2")
-        txt.insert(
-            "end",
-            "  Only scan systems you own or have explicit permission\n"
-            "  to scan. Unauthorized port scanning may be illegal.\n",
-            "key",
-        )
-        txt.configure(state="disabled")
+        self._track_popup(dialogs.show_about(self, self.VERSION))
 
     # ─────────────────────────── PROFILES & SETTINGS ───────────────────────────
 
-    def _profile_vars(self) -> dict:
-        """Settings captured in profiles and remembered between sessions."""
+    def _profile_vars(self) -> dict[str, tuple[Callable[[], Any], Callable[[Any], None]]]:
+        """Settings captured in profiles and remembered between sessions: key -> (get, set)."""
+
+        def spin(sp):
+            if isinstance(sp, QSpinBox):
+                return sp.value, lambda v: sp.setValue(int(float(v)))
+            return sp.value, lambda v: sp.setValue(float(v))
+
+        def chk(cb: QCheckBox):
+            return cb.isChecked, lambda v: cb.setChecked(bool(v))
+
+        def combo(cb: QComboBox):
+            def setter(v):
+                idx = cb.findText(str(v))
+                if idx >= 0:
+                    cb.setCurrentIndex(idx)
+
+            return cb.currentText, setter
+
         return {
-            "scan_type": self.var_scan_type,
-            "threads": self.var_threads,
-            "timeout": self.var_timeout,
-            "connect_timeout": self.var_connect_timeout,
-            "rate_limit_ms": self.var_rate_limit,
-            "attempts": self.var_retry,
-            "jitter_ms": self.var_jitter,
-            "banner_wait": self.var_max_banner,
-            "banner_grab": self.var_banner_grab,
-            "service_detect": self.var_service_detect,
-            "os_detect": self.var_os_detect,
-            "ssl_probe": self.var_ssl_probe,
-            "host_discovery": self.var_host_discovery,
-            "udp_probes": self.var_udp_probes,
-            "reverse_dns": self.var_quick_resolve,
-            "show_filtered": self.var_show_filtered,
-            "show_closed": self.var_show_closed,
-            "port_preset": self.var_port_preset,
+            "scan_type": (self._scan_type, self._set_scan_type),
+            "threads": spin(self.sp_threads),
+            "timeout": spin(self.sp_timeout),
+            "connect_timeout": spin(self.sp_connect_timeout),
+            "rate_limit_ms": spin(self.sp_rate_limit),
+            "attempts": spin(self.sp_retry),
+            "jitter_ms": spin(self.sp_jitter),
+            "banner_wait": spin(self.sp_max_banner),
+            "banner_grab": chk(self.chk_banner_grab),
+            "service_detect": chk(self.chk_service_detect),
+            "os_detect": chk(self.chk_os_detect),
+            "ssl_probe": chk(self.chk_ssl_probe),
+            "host_discovery": chk(self.chk_host_discovery),
+            "udp_probes": chk(self.chk_udp_probes),
+            "reverse_dns": chk(self.chk_quick_resolve),
+            "show_filtered": chk(self.chk_show_filtered),
+            "show_closed": chk(self.chk_show_closed),
+            "port_preset": combo(self.cb_preset),
         }
 
     def _collect_profile(self) -> dict:
-        profile = {
-            "targets": self.txt_targets.get("1.0", "end").strip(),
-            "ports": self.txt_ports.get("1.0", "end").strip(),
-        }
-        for key, var in self._profile_vars().items():
-            try:
-                profile[key] = var.get()
-            except tk.TclError:
-                pass
+        profile = {"targets": self._targets_text(), "ports": self._ports_text()}
+        for key, (getter, _setter) in self._profile_vars().items():
+            profile[key] = getter()
         return profile
 
     def _apply_profile(self, profile: dict):
         if "targets" in profile:
-            self.txt_targets.delete("1.0", "end")
-            self.txt_targets.insert("1.0", profile["targets"])
+            self.txt_targets.setPlainText(str(profile["targets"]))
         if "ports" in profile:
-            self.txt_ports.delete("1.0", "end")
-            self.txt_ports.insert("1.0", profile["ports"])
+            self.txt_ports.setPlainText(str(profile["ports"]))
 
         # Accept keys written by older versions
         legacy = {"retries": "attempts"}
         for old, new in legacy.items():
             if old in profile and new not in profile:
-                profile[new] = max(1, int(profile[old]))
+                try:
+                    profile[new] = max(1, int(profile[old]))
+                except (TypeError, ValueError):
+                    pass
 
-        for key, var in self._profile_vars().items():
+        for key, (_getter, setter) in self._profile_vars().items():
             if key in profile:
                 try:
-                    var.set(profile[key])
-                except (tk.TclError, ValueError, TypeError):
+                    setter(profile[key])
+                except (ValueError, TypeError):
                     pass
-        if self.var_scan_type.get() not in self._SCAN_TYPE_MAP:
-            self.var_scan_type.set("TCP Connect")
         self._update_scan_type_hint()
         self._count_ports()
         self._count_targets()
 
     def _save_profile(self):
         """Save current scan configuration as a profile."""
-        file = filedialog.asksaveasfilename(
-            defaultextension=".json",
-            filetypes=[("NexScan Profile", "*.json"), ("All Files", "*.*")],
-            initialfile="nexscan_profile.json",
+        file, _ = QFileDialog.getSaveFileName(
+            self, "Save Profile", "nexscan_profile.json", "NexScan Profile (*.json);;All Files (*)"
         )
         if not file:
             return
+        if not os.path.splitext(file)[1]:
+            file += ".json"
         try:
             with open(file, "w", encoding="utf-8") as f:
                 json.dump(self._collect_profile(), f, indent=2)
             self._log(f"Profile saved to {file}", "info")
             self._toast(f"Profile saved: {os.path.basename(file)}", "ok")
         except Exception as e:
-            messagebox.showerror("Error", f"Failed to save profile: {e}")
+            self._show_error("Error", f"Failed to save profile: {e}")
 
     def _load_profile(self):
         """Load a saved scan configuration profile."""
-        file = filedialog.askopenfilename(
-            filetypes=[("NexScan Profile", "*.json"), ("All Files", "*.*")]
+        file, _ = QFileDialog.getOpenFileName(
+            self, "Load Profile", "", "NexScan Profile (*.json);;All Files (*)"
         )
         if not file:
             return
@@ -3325,7 +2418,7 @@ class NexScanApp(tk.Tk):
             self._log(f"Profile loaded from {file}", "info")
             self._toast(f"Profile loaded: {os.path.basename(file)}", "ok")
         except Exception as e:
-            messagebox.showerror("Error", f"Failed to load profile: {e}")
+            self._show_error("Error", f"Failed to load profile: {e}")
 
     def _load_settings(self):
         """Restore the last session's settings (silently ignores a missing/corrupt file)."""
@@ -3334,20 +2427,35 @@ class NexScanApp(tk.Tk):
                 data = json.load(f)
         except (OSError, ValueError):
             return
-        self._apply_profile(data.get("profile", {}))
+        if not isinstance(data, dict):
+            return
+        self._apply_profile(data.get("profile", {}) or {})
         if data.get("db_path"):
-            self.var_db_path.set(data["db_path"])
-        self.var_autosave.set(bool(data.get("autosave", False)))
+            self._set_db_path(str(data["db_path"]))
+        self.chk_autosave.setChecked(bool(data.get("autosave", False)))
+
+        qt_geo = data.get("qt_geometry")
+        if isinstance(qt_geo, str) and qt_geo:
+            self.restoreGeometry(QByteArray.fromBase64(qt_geo.encode("ascii")))
+            return
+        # Settings written by the old Tk GUI: "WxH+X+Y"
         geometry = data.get("geometry")
-        if isinstance(geometry, str) and re.match(r"^\d+x\d+[+-]-?\d+[+-]-?\d+$", geometry):
-            self.geometry(geometry)
+        m = (
+            re.match(r"^(\d+)x(\d+)([+-]-?\d+)([+-]-?\d+)$", geometry or "")
+            if isinstance(geometry, str)
+            else None
+        )
+        if m:
+            w, h, x, y = (int(v) for v in m.groups())
+            self.resize(max(w, 1100), max(h, 700))
+            self.move(x, y)
 
     def _save_settings(self):
         data = {
             "profile": self._collect_profile(),
-            "db_path": self.var_db_path.get(),
-            "autosave": self.var_autosave.get(),
-            "geometry": self.geometry(),
+            "db_path": self._db_path,
+            "autosave": self.chk_autosave.isChecked(),
+            "qt_geometry": bytes(self.saveGeometry().toBase64().data()).decode("ascii"),
         }
         try:
             os.makedirs(SETTINGS_DIR, exist_ok=True)
@@ -3356,42 +2464,72 @@ class NexScanApp(tk.Tk):
         except OSError:
             pass
 
-    def _setup_bindings(self):
-        self.bind("<F5>", lambda e: self._start_scan())
-        self.bind("<F6>", lambda e: self._toggle_pause())
-        self.bind("<Escape>", lambda e: self._stop_scan())
-        self.bind("<Control-e>", lambda e: self._export_menu())
-        self.bind("<Control-l>", lambda e: self._clear_results())
-        self.bind("<Control-f>", lambda e: (self.entry_filter.focus(), "break")[1])
-        self.bind("<Control-s>", lambda e: self._save_profile())
-        self.bind("<Control-o>", lambda e: self._load_profile())
-        self.bind("<Control-h>", lambda e: self._select_tab(self.tab_history))
-        self.notebook.bind("<<NotebookTabChanged>>", self._on_tab_changed)
+    def _shortcut(self, keys, fn, widget: Optional[QWidget] = None):
+        sc = QShortcut(QKeySequence(keys), widget or self)
+        if widget is not None:
+            sc.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
+        sc.activated.connect(fn)
+        return sc
 
-    def _on_tab_changed(self, _event=None):
-        try:
-            current = self.notebook.nametowidget(self.notebook.select())
-        except (KeyError, tk.TclError):
-            return
-        if current is self.tab_history:
+    def _setup_bindings(self):
+        self._shortcut("F5", self._start_scan)
+        self._shortcut("F6", self._toggle_pause)
+        self._shortcut("Escape", self._stop_scan)
+        self._shortcut("Ctrl+E", self._export_menu)
+        self._shortcut("Ctrl+L", self._clear_results)
+        self._shortcut("Ctrl+F", self._focus_filter)
+        self._shortcut("Ctrl+S", self._save_profile)
+        self._shortcut("Ctrl+O", self._load_profile)
+        self._shortcut("Ctrl+H", lambda: self._select_tab(self.tab_history))
+        # Table-local keys
+        self._shortcut(QKeySequence.StandardKey.Copy, self._copy_selected_rows, self.tree)
+        self._shortcut("Return", self._show_port_detail, self.tree)
+        self._shortcut("Enter", self._show_port_detail, self.tree)
+        self.notebook.currentChanged.connect(self._on_tab_changed)
+
+    def _focus_filter(self):
+        self._select_tab(self.tab_results)
+        self.entry_filter.setFocus()
+        self.entry_filter.selectAll()
+
+    def _on_tab_changed(self, _index: int = 0):
+        if self.notebook.currentWidget() is self.tab_history:
             self._refresh_history()
 
-    def _on_close(self):
+    def closeEvent(self, event: QCloseEvent):
         if self.is_scanning:
-            ok = messagebox.askyesno(
-                "Scan Running", "A scan is currently running. Stop it and exit?", icon="warning"
-            )
+            ok = self._ask_yes_no("Scan Running", "A scan is currently running. Stop it and exit?")
             if not ok:
+                event.ignore()
                 return
             if self.scanner:
                 self.scanner.stop()
         self._save_settings()
-        self.destroy()
+        event.accept()
+
+    # Kept for API compatibility with the Tk version
+    def _on_close(self):
+        self.close()
+
+
+def create_app(argv: Optional[list] = None) -> QApplication:
+    """Create (or reuse) the QApplication and apply the NexScan theme."""
+    app = QApplication.instance()
+    if app is None:
+        app = QApplication(argv if argv is not None else sys.argv)
+    app.setApplicationName("NexScan")
+    app.setStyle("Fusion")  # consistent base for the stylesheet on every platform
+    init_fonts()
+    app.setFont(Fonts.mono_sm())
+    app.setStyleSheet(stylesheet())
+    return app  # type: ignore[return-value]
 
 
 def main():
-    app = NexScanApp()
-    app.mainloop()
+    app = create_app()
+    window = NexScanApp()
+    window.show()
+    sys.exit(app.exec())
 
 
 if __name__ == "__main__":

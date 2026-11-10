@@ -1,10 +1,8 @@
 # NexScan v3.0 — Runtime dependencies
-# No third-party packages are required for normal use.
-# tkinter ships with CPython; install the system package if missing:
-#   Debian/Ubuntu:  sudo apt-get install python3-tk
-#   Fedora:         sudo dnf install python3-tkinter
-#   macOS Homebrew: brew install python-tk
-#
+# The GUI is built with PyQt6 (wheels bundle Qt — no system packages needed on
+# Windows/macOS; most Linux desktops already have the required libGL/libEGL/xcb libs).
+PyQt6>=6.5
+
 # Optional — more robust TLS certificate parsing (stdlib fallback otherwise):
 #   cryptography>=41
 
