@@ -206,7 +206,11 @@ def format_cve_report(service_name: str, version: str, cves: List[CVEInfo]) -> s
         severity_icon = (
             "🔴"
             if cve.severity == "CRITICAL"
-            else "🟠" if cve.severity == "HIGH" else "🟡" if cve.severity == "MEDIUM" else "🟢"
+            else "🟠"
+            if cve.severity == "HIGH"
+            else "🟡"
+            if cve.severity == "MEDIUM"
+            else "🟢"
         )
         desc = cve.description if len(cve.description) < 160 else cve.description[:157] + "..."
         lines.append(f"    {severity_icon} {cve.cve_id}  [{cve.severity} / {cve.score}]  {desc}")

@@ -103,7 +103,7 @@ def export_xml(results: List[ScanResult]) -> str:
                 lines.append(
                     f'      <port number="{p.port}" protocol="{p.protocol}" state="{p.state.value}" '
                     f'service="{_esc(p.service)}" version="{_esc(p.version)}" '
-                    f'response_ms="{round(p.response_time*1000,2)}"{ssl_attr}>'
+                    f'response_ms="{round(p.response_time * 1000, 2)}"{ssl_attr}>'
                 )
                 if p.banner:
                     lines.append(f"        <banner><![CDATA[{_cdata(p.banner[:200])}]]></banner>")
@@ -150,7 +150,7 @@ def export_txt(results: List[ScanResult]) -> str:
         open_ports = [p for p in r.ports if p.state == PortState.OPEN]
         if open_ports:
             lines.append(f"  {'PORT':<10} {'PROTO':<6} {'STATE':<12} {'SERVICE':<18} {'VERSION'}")
-            lines.append(f"  {'-'*8:<10} {'-'*5:<6} {'-'*10:<12} {'-'*16:<18} {'-'*20}")
+            lines.append(f"  {'-' * 8:<10} {'-' * 5:<6} {'-' * 10:<12} {'-' * 16:<18} {'-' * 20}")
             for p in open_ports:
                 lines.append(
                     f"  {p.port:<10} {p.protocol:<6} {p.state.value:<12} {p.service:<18} {p.version[:30]}"
@@ -160,7 +160,7 @@ def export_txt(results: List[ScanResult]) -> str:
                     lines.append(f"  {'':10} {'':6} Banner: {short_banner}")
                 if p.ssl_info:
                     lines.append(
-                        f"  {'':10} {'':6} SSL: {p.ssl_info.get('version','')}  CN={p.ssl_info.get('common_name','')}"
+                        f"  {'':10} {'':6} SSL: {p.ssl_info.get('version', '')}  CN={p.ssl_info.get('common_name', '')}"
                     )
         else:
             lines.append("  No open ports found.")
@@ -184,7 +184,7 @@ def export_html(results: List[ScanResult]) -> str:
         for p in open_ports:
             ssl_badge = ""
             if p.ssl_info:
-                ssl_badge = f'<span class="badge ssl">{p.ssl_info.get("version","SSL")}</span>'
+                ssl_badge = f'<span class="badge ssl">{p.ssl_info.get("version", "SSL")}</span>'
             port_rows += f"""
             <tr>
               <td><strong>{p.port}</strong></td>
@@ -192,8 +192,8 @@ def export_html(results: List[ScanResult]) -> str:
               <td><span class="badge open">OPEN</span></td>
               <td>{_esc(p.service)} {ssl_badge}</td>
               <td>{_esc(p.version)}</td>
-              <td class="banner">{_esc(p.banner.splitlines()[0][:80]) if p.banner else ''}</td>
-              <td>{round(p.response_time*1000,1)}ms</td>
+              <td class="banner">{_esc(p.banner.splitlines()[0][:80]) if p.banner else ""}</td>
+              <td>{round(p.response_time * 1000, 1)}ms</td>
             </tr>"""
         if not port_rows:
             port_rows = (
@@ -210,10 +210,10 @@ def export_html(results: List[ScanResult]) -> str:
     <div class="host-card">
       <div class="host-header">
         <div>
-          <span class="host-status {status_cls}">{'● UP' if r.host_up else '○ DOWN'}</span>
+          <span class="host-status {status_cls}">{"● UP" if r.host_up else "○ DOWN"}</span>
           <span class="host-target">{_esc(r.target)}</span>
-          {f'<span class="host-ip">{_esc(r.ip_address)}</span>' if r.ip_address != r.target else ''}
-          {f'<span class="host-rdns">{_esc(r.hostname)}</span>' if r.hostname and r.hostname != r.target else ''}
+          {f'<span class="host-ip">{_esc(r.ip_address)}</span>' if r.ip_address != r.target else ""}
+          {f'<span class="host-rdns">{_esc(r.hostname)}</span>' if r.hostname and r.hostname != r.target else ""}
         </div>
         <div class="host-meta">
           {os_info}

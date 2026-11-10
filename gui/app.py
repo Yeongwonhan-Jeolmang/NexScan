@@ -2566,14 +2566,14 @@ class NexScanApp(tk.Tk):
                 w(f"  {p.port:<8} {p.protocol.upper():<6} ", "value")
                 w(f"{p.service:<18} ", "open")
                 w(f"{p.version[:24]:<25} ", "value")
-                w(f"{p.response_time*1000:>7.1f}ms\n", "value")
+                w(f"{p.response_time * 1000:>7.1f}ms\n", "value")
                 if p.banner:
                     for line in p.banner.splitlines()[:4]:
                         w(f"          ↳ {line[:65]}\n", "banner_text")
                 if p.ssl_info:
                     ssl = p.ssl_info
                     w(
-                        f"          ↳ SSL: {ssl.get('version','')}  Cipher: {ssl.get('cipher','')} ({ssl.get('cipher_bits',0)} bits)\n",
+                        f"          ↳ SSL: {ssl.get('version', '')}  Cipher: {ssl.get('cipher', '')} ({ssl.get('cipher_bits', 0)} bits)\n",
                         "ssl_text",
                     )
                     if ssl.get("common_name"):
@@ -2590,7 +2590,7 @@ class NexScanApp(tk.Tk):
             w(sep, "sep")
             ports_str = ", ".join(str(p.port) for p in filt_ports[:50])
             if len(filt_ports) > 50:
-                ports_str += f" ... (+{len(filt_ports)-50} more)"
+                ports_str += f" ... (+{len(filt_ports) - 50} more)"
             w(f"  {ports_str}\n", "filtered")
 
         dt.configure(state="disabled")
@@ -3104,7 +3104,7 @@ class NexScanApp(tk.Tk):
             w("CPE        : ", "key")
             w(f"{pr.cpe}\n", "val")
         w("RTT        : ", "key")
-        w(f"{pr.response_time*1000:.2f}ms\n", "val")
+        w(f"{pr.response_time * 1000:.2f}ms\n", "val")
         if pr.extra_info:
             w("Notes      : ", "key")
             w(f"{pr.extra_info}\n", "val")
