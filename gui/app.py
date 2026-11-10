@@ -1902,14 +1902,14 @@ class NexScanApp(QMainWindow):
                 w(f"  {p.port:<8} {p.protocol.upper():<6} ", "value")
                 w(f"{p.service:<18} ", "open")
                 w(f"{p.version[:24]:<25} ", "value")
-                w(f"{p.response_time * 1000:>7.1f}ms\n", "value")
+                w(f"{p.response_time*1000:>7.1f}ms\n", "value")
                 if p.banner:
                     for line in p.banner.splitlines()[:4]:
                         w(f"          ↳ {line[:65]}\n", "banner_text")
                 if p.ssl_info:
                     ssl = p.ssl_info
                     w(
-                        f"          ↳ SSL: {ssl.get('version', '')}  Cipher: {ssl.get('cipher', '')} ({ssl.get('cipher_bits', 0)} bits)\n",
+                        f"          ↳ SSL: {ssl.get('version','')}  Cipher: {ssl.get('cipher','')} ({ssl.get('cipher_bits',0)} bits)\n",
                         "ssl_text",
                     )
                     if ssl.get("common_name"):
@@ -1926,7 +1926,7 @@ class NexScanApp(QMainWindow):
             w(sep, "sep")
             ports_str = ", ".join(str(p.port) for p in filt_ports[:50])
             if len(filt_ports) > 50:
-                ports_str += f" ... (+{len(filt_ports) - 50} more)"
+                ports_str += f" ... (+{len(filt_ports)-50} more)"
             w(f"  {ports_str}\n", "filtered")
         dt.scroll_to_top()
 
@@ -2434,21 +2434,34 @@ class NexScanApp(QMainWindow):
             self._set_db_path(str(data["db_path"]))
         self.chk_autosave.setChecked(bool(data.get("autosave", False)))
 
+        try:
+            self._restore_geometry(data)
+        except Exception:
+            pass  # a bad saved geometry must never stop the app from starting
+
+    def _restore_geometry(self, data: dict):
         qt_geo = data.get("qt_geometry")
         if isinstance(qt_geo, str) and qt_geo:
             self.restoreGeometry(QByteArray.fromBase64(qt_geo.encode("ascii")))
             return
-        # Settings written by the old Tk GUI: "WxH+X+Y"
+        # Settings written by the old Tk GUI: "WxH+X+Y". Tk writes negative offsets as
+        # "+-16" (e.g. a maximised window on Windows), so the sign is "+", "-" or "+-".
         geometry = data.get("geometry")
-        m = (
-            re.match(r"^(\d+)x(\d+)([+-]-?\d+)([+-]-?\d+)$", geometry or "")
-            if isinstance(geometry, str)
-            else None
-        )
-        if m:
-            w, h, x, y = (int(v) for v in m.groups())
-            self.resize(max(w, 1100), max(h, 700))
-            self.move(x, y)
+        if not isinstance(geometry, str):
+            return
+        m = re.match(r"^(\d+)x(\d+)(\+-?\d+|-\d+)(\+-?\d+|-\d+)$", geometry.strip())
+        if not m:
+            return
+        w, h = int(m.group(1)), int(m.group(2))
+        x, y = (int(v.lstrip("+")) for v in m.group(3, 4))
+        self.resize(max(w, 1100), max(h, 700))
+        # Keep the title bar on a visible screen
+        screen = QApplication.screenAt(QPoint(x + 50, y + 50)) or QApplication.primaryScreen()
+        if screen is not None:
+            area = screen.availableGeometry()
+            x = min(max(x, area.left()), max(area.left(), area.right() - 200))
+            y = min(max(y, area.top()), max(area.top(), area.bottom() - 100))
+        self.move(x, y)
 
     def _save_settings(self):
         data = {

@@ -15,20 +15,27 @@ pytest.importorskip("PyQt6.QtWidgets")
 from core.scanner import PortResult, PortState, ScanResult  # noqa: E402
 
 
+@pytest.fixture(scope="session")
+def qapp():
+    """One QApplication for the whole session (it must outlive every widget)."""
+    import gui.app as app_mod
+
+    return app_mod.create_app([])
+
+
 @pytest.fixture()
-def window(tmp_path, monkeypatch):
+def window(qapp, tmp_path, monkeypatch):
     import gui.app as app_mod
 
     monkeypatch.setattr(app_mod, "SETTINGS_DIR", str(tmp_path / "cfg"))
     monkeypatch.setattr(app_mod, "SETTINGS_FILE", str(tmp_path / "cfg" / "settings.json"))
-    app = app_mod.create_app([])
     win = app_mod.NexScanApp()
     win._set_db_path(str(tmp_path / "history.db"))
     yield win
     win.is_scanning = False
     win.close()
     win.deleteLater()
-    app.processEvents()
+    qapp.processEvents()
 
 
 def _host(target="10.0.0.1"):
@@ -125,3 +132,28 @@ def test_settings_persist(window, tmp_path):
         assert other.sp_threads.value() == 77
     finally:
         other.close()
+
+
+@pytest.mark.parametrize(
+    "geometry",
+    ["1400x900+-16+-16", "1400x900+100+50", "1400x900-8-8", "1200x800+-1920+0", "garbage", ""],
+)
+def test_legacy_tk_geometry_does_not_crash(qapp, tmp_path, monkeypatch, geometry):
+    """Settings files written by the old Tkinter GUI must load (regression: '+-16')."""
+    import json
+
+    import gui.app as app_mod
+
+    cfg = tmp_path / "cfg"
+    cfg.mkdir()
+    settings = cfg / "settings.json"
+    settings.write_text(json.dumps({"profile": {"threads": 123}, "geometry": geometry}))
+    monkeypatch.setattr(app_mod, "SETTINGS_DIR", str(cfg))
+    monkeypatch.setattr(app_mod, "SETTINGS_FILE", str(settings))
+    win = app_mod.NexScanApp()
+    try:
+        assert win.sp_threads.value() == 123
+        if geometry.startswith("1400x900"):
+            assert win.width() >= 1100
+    finally:
+        win.close()
